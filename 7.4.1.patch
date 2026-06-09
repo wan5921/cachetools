@@ -1,0 +1,316 @@
+diff --git a/_verify_refactor.py b/_verify_refactor.py
+new file mode 100644
+index 0000000..e03a995
+--- /dev/null
++++ b/_verify_refactor.py
+@@ -0,0 +1,166 @@
++import sys
++import os
++sys.path.insert(0, '/app/cachetools/src')
++os.chdir('/app/cachetools')
++
++from cachetools import LFUCache
++
++def test_lfu():
++    cache = LFUCache(maxsize=2)
++    cache[1] = 1
++    cache[1]
++    cache[2] = 2
++    cache[3] = 3
++    assert len(cache) == 2
++    assert cache[1] == 1
++    assert (2 in cache) ^ (3 in cache)
++    cache[4] = 4
++    assert len(cache) == 2
++    assert cache[4] == 4
++    assert cache[1] == 1
++    cache[1]
++    assert len(cache) == 2
++    assert cache[1] == 1
++    assert cache[4] == 4
++    print("PASS: test_lfu")
++
++def test_lfu_getsizeof():
++    cache = LFUCache(maxsize=3, getsizeof=lambda x: x)
++    cache[1] = 1
++    cache[2] = 2
++    assert len(cache) == 2
++    assert cache[1] == 1
++    assert cache[2] == 2
++    cache[3] = 3
++    assert len(cache) == 1
++    assert cache[3] == 3
++    assert 1 not in cache
++    assert 2 not in cache
++    try:
++        cache[4] = 4
++        assert False
++    except ValueError:
++        pass
++    assert len(cache) == 1
++    assert cache[3] == 3
++    print("PASS: test_lfu_getsizeof")
++
++def test_lfu_update_existing():
++    cache = LFUCache(maxsize=2)
++    cache[1] = 1
++    cache[2] = 2
++    cache[1] = "updated"
++    cache[3] = 3
++    assert cache[1] == "updated"
++    assert 3 in cache
++    assert 2 not in cache
++    print("PASS: test_lfu_update_existing")
++
++def test_lfu_clear():
++    cache = LFUCache(maxsize=2)
++    cache[1] = 1
++    cache[1]
++    cache[1]
++    cache[2] = 2
++    cache.clear()
++    assert 0 == len(cache)
++    assert 0 == cache.currsize
++    cache[3] = 3
++    cache[4] = 4
++    cache[3]
++    cache[5] = 5
++    assert 2 == len(cache)
++    assert 3 in cache
++    assert 5 in cache
++    assert 4 not in cache
++    print("PASS: test_lfu_clear")
++
++def test_missing():
++    class DefaultCache(LFUCache):
++        def __missing__(self, key):
++            self[key] = key
++            return key
++    cache = DefaultCache(maxsize=2)
++    assert cache[1] == 1
++    assert cache[2] == 2
++    assert len(cache) == 2
++    assert cache[3] == 3
++    assert len(cache) == 2
++    assert 3 in cache
++    print("PASS: test_missing")
++
++def test_missing_getsizeof():
++    class DefaultCache(LFUCache):
++        def __missing__(self, key):
++            try:
++                self[key] = key
++            except ValueError:
++                pass
++            return key
++    cache = DefaultCache(maxsize=2, getsizeof=lambda x: x)
++    assert cache[1] == 1
++    assert cache[2] == 2
++    assert 1 not in cache
++    assert 2 in cache
++    assert cache[3] == 3
++    assert cache[1] == 1
++    assert (1, 1) == cache.popitem()
++    print("PASS: test_missing_getsizeof")
++
++def test_getsizeof_param():
++    cache = LFUCache(maxsize=3, getsizeof=lambda x: x)
++    cache.update({1: 1, 2: 2})
++    assert cache[1] == 1
++    assert cache[2] == 2
++    cache[1] = 2
++    assert 1 == len(cache)
++    assert 2 == cache.currsize
++    assert 2 == cache[1]
++    assert 2 not in cache
++    cache.update({1: 1, 2: 2})
++    cache[3] = 3
++    assert 1 == len(cache)
++    assert 3 == cache.currsize
++    assert 3 == cache[3]
++    print("PASS: test_getsizeof_param")
++
++def test_popitem():
++    cache = LFUCache(maxsize=2)
++    cache.update({1: 1, 2: 2})
++    key, _ = cache.popitem()
++    assert key in {1, 2}
++    assert 1 == len(cache)
++    key, _ = cache.popitem()
++    assert key in {1, 2}
++    assert 0 == len(cache)
++    try:
++        cache.popitem()
++        assert False
++    except KeyError:
++        pass
++    print("PASS: test_popitem")
++
++def test_pickle():
++    import pickle
++    source = LFUCache(maxsize=2)
++    source.update({1: 1, 2: 2})
++    cache = pickle.loads(pickle.dumps(source))
++    assert source == cache
++    assert 2 == len(cache)
++    assert 1 == cache[1]
++    assert 2 == cache[2]
++    cache[3] = 3
++    assert 2 == len(cache)
++    assert 3 == cache[3]
++    print("PASS: test_pickle")
++
++test_lfu()
++test_lfu_getsizeof()
++test_lfu_update_existing()
++test_lfu_clear()
++test_missing()
++test_missing_getsizeof()
++test_getsizeof_param()
++test_popitem()
++test_pickle()
++print("\n=== ALL TESTS PASSED ===")
+diff --git a/src/cachetools/__init__.py b/src/cachetools/__init__.py
+index 1b299c5..9db57d7 100644
+--- a/src/cachetools/__init__.py
++++ b/src/cachetools/__init__.py
+@@ -196,24 +196,36 @@ class FIFOCache(Cache):
+ class LFUCache(Cache):
+     """Least Frequently Used (LFU) cache implementation."""
+ 
+-    class _Link:
+-        __slots__ = ("count", "keys", "next", "prev")
++    # cleanup the heap if it grows too large relative to live items
++    __HEAP_CLEANUP_FACTOR = 4
++
++    @functools.total_ordering
++    class _Item:
++        __slots__ = ("key", "count", "seq", "removed")
+ 
+-        def __init__(self, count):
++        def __init__(self, key, count, seq):
++            self.key = key
+             self.count = count
+-            self.keys = set()
++            self.seq = seq
++            self.removed = False
+ 
+-        def unlink(self):
+-            next = self.next
+-            prev = self.prev
+-            prev.next = next
+-            next.prev = prev
++        def __lt__(self, other):
++            if self.count != other.count:
++                return self.count < other.count
++            return self.seq < other.seq
++
++        def __eq__(self, other):
++            return (
++                self.count == other.count
++                and self.seq == other.seq
++                and self.key == other.key
++            )
+ 
+     def __init__(self, maxsize, getsizeof=None):
+         Cache.__init__(self, maxsize, getsizeof)
+-        self.__root = root = LFUCache._Link(0)  # sentinel
+-        root.prev = root.next = root
+-        self.__links = {}
++        self.__items = {}
++        self.__heap = []
++        self.__seq = 0
+ 
+     def __getitem__(self, key, cache_getitem=Cache.__getitem__):
+         value = cache_getitem(self, key)
+@@ -223,58 +235,53 @@ class LFUCache(Cache):
+ 
+     def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+         cache_setitem(self, key, value)
+-        if key in self.__links:
++        if key in self.__items:
++            # existing key: increment frequency (same as __touch)
+             self.__touch(key)
+             return
+-        root = self.__root
+-        link = root.next
+-        if link.count != 1:
+-            link = LFUCache._Link(1)
+-            link.next = root.next
+-            root.next = link.next.prev = link
+-            link.prev = root
+-        link.keys.add(key)
+-        self.__links[key] = link
++        # new key: starts at count=1
++        self.__seq += 1
++        item = LFUCache._Item(key, 1, self.__seq)
++        self.__items[key] = item
++        heapq.heappush(self.__heap, item)
+ 
+     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+         cache_delitem(self, key)
+-        link = self.__links.pop(key)
+-        link.keys.remove(key)
+-        if not link.keys:
+-            link.unlink()
++        item = self.__items.pop(key)
++        item.removed = True
+ 
+     def popitem(self):
+         """Remove and return the `(key, value)` pair least frequently used."""
+-        root = self.__root
+-        curr = root.next
+-        if curr is root:
++        heap = self.__heap
++        items = self.__items
++        if not items:
++            raise KeyError("%s is empty" % type(self).__name__) from None
++        # pop stale entries from the heap top until we find a live one
++        while heap and heap[0].removed:
++            heapq.heappop(heap)
++        # clean up the heap if too many stale entries accumulate
++        if len(heap) > len(items) * self.__HEAP_CLEANUP_FACTOR:
++            self.__heap = heap = [it for it in heap if not it.removed]
++            heapq.heapify(heap)
++        if not heap:
+             raise KeyError("%s is empty" % type(self).__name__) from None
+-        key = next(iter(curr.keys))  # remove an arbitrary element
+-        return (key, self.pop(key))
++        item = heap[0]
++        return (item.key, self.pop(item.key))
+ 
+     def clear(self):
+         Cache.clear(self)
+-        root = self.__root
+-        root.prev = root.next = root
+-        self.__links.clear()
++        self.__items.clear()
++        del self.__heap[:]
++        self.__seq = 0
+ 
+     def __touch(self, key):
+         """Increment use count"""
+-        link = self.__links[key]
+-        curr = link.next
+-        if curr.count != link.count + 1:
+-            if len(link.keys) == 1:
+-                link.count += 1
+-                return
+-            curr = LFUCache._Link(link.count + 1)
+-            curr.next = link.next
+-            link.next = curr.next.prev = curr
+-            curr.prev = link
+-        curr.keys.add(key)
+-        link.keys.remove(key)
+-        if not link.keys:
+-            link.unlink()
+-        self.__links[key] = curr
++        old = self.__items[key]
++        old.removed = True
++        self.__seq += 1
++        new = LFUCache._Item(key, old.count + 1, self.__seq)
++        self.__items[key] = new
++        heapq.heappush(self.__heap, new)
+ 
+ 
+ class LRUCache(Cache):
