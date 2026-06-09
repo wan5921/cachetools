@@ -1,0 +1,337 @@
+diff --git a/src/cachetools/__init__.py b/src/cachetools/__init__.py
+index 1b299c5..4bca4fa 100644
+--- a/src/cachetools/__init__.py
++++ b/src/cachetools/__init__.py
+@@ -19,6 +19,7 @@ import collections.abc
+ import functools
+ import heapq
+ import random
++import threading
+ import time
+ 
+ from . import keys
+@@ -466,58 +467,65 @@ class TTLCache(_TimedCache):
+         root.prev = root.next = root
+         self.__links = collections.OrderedDict()
+         self.__ttl = ttl
++        self.__lock = threading.RLock()
+ 
+     def __contains__(self, key):
+-        try:
+-            link = self.__links[key]  # no reordering
+-        except KeyError:
+-            return False
+-        else:
+-            return self.timer() < link.expires
++        with self.__lock:
++            try:
++                link = self.__links[key]  # no reordering
++            except KeyError:
++                return False
++            else:
++                return self.timer() < link.expires
+ 
+     def __getitem__(self, key, cache_getitem=Cache.__getitem__):
+-        try:
+-            link = self.__getlink(key)
+-        except KeyError:
+-            expired = False
+-        else:
+-            expired = not (self.timer() < link.expires)
+-        if expired:
+-            return self.__missing__(key)
+-        else:
+-            return cache_getitem(self, key)
++        with self.__lock:
++            try:
++                link = self.__getlink(key)
++            except KeyError:
++                expired = False
++            else:
++                expired = not (self.timer() < link.expires)
++            if expired:
++                return self.__missing__(key)
++            else:
++                return cache_getitem(self, key)
+ 
+     def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+-        with self.timer as time:
+-            self.expire(time)
+-            cache_setitem(self, key, value)
+-        try:
+-            link = self.__getlink(key)
+-        except KeyError:
+-            self.__links[key] = link = TTLCache._Link(key)
+-        else:
+-            link.unlink()
+-        link.expires = time + self.__ttl
+-        link.next = root = self.__root
+-        link.prev = prev = root.prev
+-        prev.next = root.prev = link
++        with self.__lock:
++            with self.timer as time:
++                self.expire(time)
++                cache_setitem(self, key, value)
++            try:
++                link = self.__getlink(key)
++            except KeyError:
++                self.__links[key] = link = TTLCache._Link(key)
++            else:
++                link.unlink()
++            link.expires = time + self.__ttl
++            link.next = root = self.__root
++            link.prev = prev = root.prev
++            prev.next = root.prev = link
+ 
+     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+-        cache_delitem(self, key)
+-        link = self.__links.pop(key)
+-        link.unlink()
+-        if not (self.timer() < link.expires):
+-            raise KeyError(key)
++        with self.__lock:
++            cache_delitem(self, key)
++            link = self.__links.pop(key)
++            link.unlink()
++            if not (self.timer() < link.expires):
++                raise KeyError(key)
+ 
+     def __iter__(self):
+-        root = self.__root
+-        curr = root.next
+-        while curr is not root:
+-            # "freeze" time for iterator access
++        with self.__lock:
+             with self.timer as time:
+-                if time < curr.expires:
+-                    yield curr.key
+-            curr = curr.next
++                self.expire(time)
++            root = self.__root
++            curr = root.next
++            keys = []
++            while curr is not root:
++                keys.append(curr.key)
++                curr = curr.next
++        yield from keys
+ 
+     def __setstate__(self, state):
+         self.__dict__.update(state)
+@@ -527,7 +535,8 @@ class TTLCache(_TimedCache):
+             link.next = root
+             link.prev = prev = root.prev
+             prev.next = root.prev = link
+-        self.expire(self.timer())
++        with self.__lock:
++            self.expire(self.timer())
+ 
+     @property
+     def ttl(self):
+@@ -539,21 +548,22 @@ class TTLCache(_TimedCache):
+         expired `(key, value)` pairs.
+ 
+         """
+-        if time is None:
+-            time = self.timer()
+-        root = self.__root
+-        curr = root.next
+-        links = self.__links
+-        expired = []
+-        cache_delitem = Cache.__delitem__
+-        cache_getitem = Cache.__getitem__
+-        while curr is not root and not (time < curr.expires):
+-            expired.append((curr.key, cache_getitem(self, curr.key)))
+-            cache_delitem(self, curr.key)
+-            del links[curr.key]
+-            next = curr.next
+-            curr.unlink()
+-            curr = next
++        with self.__lock:
++            if time is None:
++                time = self.timer()
++            root = self.__root
++            curr = root.next
++            links = self.__links
++            expired = []
++            cache_delitem = Cache.__delitem__
++            cache_getitem = Cache.__getitem__
++            while curr is not root and not (time < curr.expires):
++                expired.append((curr.key, cache_getitem(self, curr.key)))
++                cache_delitem(self, curr.key)
++                del links[curr.key]
++                next = curr.next
++                curr.unlink()
++                curr = next
+         return expired
+ 
+     def popitem(self):
+@@ -561,20 +571,22 @@ class TTLCache(_TimedCache):
+         has not already expired.
+ 
+         """
+-        with self.timer as time:
+-            self.expire(time)
+-            try:
+-                key = next(iter(self.__links))
+-            except StopIteration:
+-                raise KeyError("%s is empty" % type(self).__name__) from None
+-            else:
+-                return (key, self.pop(key))
++        with self.__lock:
++            with self.timer as time:
++                self.expire(time)
++                try:
++                    key = next(iter(self.__links))
++                except StopIteration:
++                    raise KeyError("%s is empty" % type(self).__name__) from None
++                else:
++                    return (key, self.pop(key))
+ 
+     def clear(self):
+-        _TimedCache.clear(self)
+-        root = self.__root
+-        root.prev = root.next = root
+-        self.__links.clear()
++        with self.__lock:
++            _TimedCache.clear(self)
++            root = self.__root
++            root.prev = root.next = root
++            self.__links.clear()
+ 
+     def __getlink(self, key):
+         value = self.__links[key]
+diff --git a/tests/test_ttl.py b/tests/test_ttl.py
+index e023173..eeec04f 100644
+--- a/tests/test_ttl.py
++++ b/tests/test_ttl.py
+@@ -1,4 +1,6 @@
+ import math
++import threading
++import time
+ import unittest
+ 
+ from cachetools import TTLCache
+@@ -245,3 +247,123 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
+         cache.timer.tick()
+         cache.timer.tick()  # past TTL
+         self.assertNotIn(42, cache)
++
++    def test_ttl_concurrent(self):
++        cache = TTLCache(maxsize=100, ttl=0.05, timer=time.monotonic)
++
++        errors = []
++        stop = threading.Event()
++
++        def reader():
++            try:
++                while not stop.is_set():
++                    try:
++                        cache["key"]
++                    except KeyError:
++                        pass
++                    except Exception as e:
++                        errors.append(e)
++            except Exception as e:
++                errors.append(e)
++
++        def writer():
++            try:
++                for i in range(50):
++                    try:
++                        cache[i] = i
++                    except Exception as e:
++                        errors.append(e)
++                    time.sleep(0.001)
++            except Exception as e:
++                errors.append(e)
++
++        cache["key"] = "value"
++
++        threads = []
++        for _ in range(10):
++            t = threading.Thread(target=writer)
++            threads.append(t)
++        for _ in range(10):
++            t = threading.Thread(target=reader)
++            threads.append(t)
++
++        for t in threads:
++            t.start()
++
++        for t in threads:
++            t.join(timeout=10)
++
++        stop.set()
++
++        time.sleep(0.1)
++
++        self.assertEqual(0, len(errors))
++
++        with self.assertRaises(KeyError):
++            cache["key"]
++
++    def test_ttl_concurrent_expiry(self):
++        cache = TTLCache(maxsize=10, ttl=0.1)
++        cache["test_key"] = "test_value"
++
++        self.assertEqual("test_value", cache["test_key"])
++
++        errors = []
++        lock = threading.Lock()
++        seen_valid = []
++        seen_keyerror = []
++        NITER = 200
++        NTHREADS = 20
++
++        def worker():
++            try:
++                for _ in range(NITER):
++                    try:
++                        val = cache["test_key"]
++                        if val == "test_value":
++                            with lock:
++                                seen_valid.append(1)
++                        else:
++                            with lock:
++                                errors.append(
++                                    Exception(f"Unexpected value: {val}")
++                                )
++                    except KeyError:
++                        with lock:
++                            seen_keyerror.append(1)
++            except Exception as e:
++                with lock:
++                    errors.append(e)
++
++        def writer():
++            for i in range(100):
++                try:
++                    cache[i] = i
++                except Exception as e:
++                    with lock:
++                        errors.append(e)
++
++        threads = [threading.Thread(target=worker) for _ in range(NTHREADS)]
++        threads.append(threading.Thread(target=writer))
++
++        for t in threads:
++            t.start()
++
++        for t in threads:
++            t.join(timeout=10)
++
++        time.sleep(0.2)
++
++        with self.assertRaises(KeyError):
++            cache["test_key"]
++
++        self.assertEqual(
++            0, len(errors),
++            f"Got {len(errors)} error(s): {errors}"
++        )
++
++        self.assertGreater(
++            len(seen_keyerror), 0,
++            "Expected at least one KeyError from expired reads"
++        )
++
