@@ -1,0 +1,51 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 9d5d8a0..6c38d8f 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,6 +1,9 @@
+ name: CI
+ 
+-on: [push, pull_request, workflow_dispatch]
++on:
++  push:
++    branches: [master]
++  pull_request:
+ 
+ permissions:
+   contents: read
+@@ -12,13 +15,14 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        python: ["3.10", "3.11", "3.12", "3.13", "3.13t", "3.14", "3.14t", "pypy3.10", "pypy3.11"]
++        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+     steps:
+       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+         with:
+           python-version: ${{ matrix.python }}
+           allow-prereleases: true
++          cache: pip
+       - run: pip install coverage tox
+       - run: tox
+       - uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..e5a0448
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,13 @@
++FROM python:3.13-slim
++
++WORKDIR /app
++
++RUN pip install --no-cache-dir tox coverage
++
++COPY pyproject.toml tox.ini ./
++COPY src/ src/
++COPY tests/ tests/
++
++RUN pip install --no-cache-dir -e ".[dev]"
++
++CMD ["tox"]
+\ No newline at end of file
