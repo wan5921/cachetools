@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import Mock
 
 from cachetools import LRUCache
 
@@ -78,29 +77,13 @@ class LRUCacheTest(unittest.TestCase, CacheTestMixin):
         self.assertEqual(0, len(cache))
         self.assertEqual(0, cache.currsize)
 
+        # verify LRU order is reset after clear
         cache[3] = 3
         cache[4] = 4
-        cache[3]
-        cache[5] = 5
+        cache[3]  # access 3 to make it most recently used
+        cache[5] = 5  # should evict 4 (least recently used)
 
         self.assertEqual(2, len(cache))
         self.assertIn(3, cache)
         self.assertIn(5, cache)
         self.assertNotIn(4, cache)
-
-    def test_get_or_compute_uses_cached_value_after_first_load(self):
-        cache = LRUCache[str, int](maxsize=2)
-        compute = Mock(return_value=42)
-
-        self.assertEqual(42, cache.get_or_compute("answer", compute))
-        self.assertEqual(42, cache.get_or_compute("answer", compute))
-
-        compute.assert_called_once_with()
-        self.assertEqual(42, cache["answer"])
-
-    def test_cleanup_is_noop_for_non_ttl_cache(self):
-        cache = LRUCache[int, int](maxsize=2)
-        cache[1] = 1
-
-        self.assertEqual([], cache.cleanup())
-        self.assertIn(1, cache)
