@@ -25,6 +25,7 @@ __all__: Final = (
     "TTLCache",
     "cached",
     "cachedmethod",
+    "create_cache",
 )
 __version__: str
 
@@ -52,6 +53,8 @@ class Cache(MutableMapping[_KT, _VT]):
     @overload
     def pop(self, key: _KT, default: _VT | _T) -> _VT | _T: ...
     def setdefault(self, key: _KT, default: _VT | None = None) -> _VT: ...
+    def get_or_compute(self, key: _KT, compute_func: Callable[[], _VT]) -> _VT: ...
+    def cleanup(self) -> list[tuple[_KT, _VT]]: ...
     @property
     def maxsize(self) -> float: ...
     @property
@@ -104,7 +107,7 @@ class TTLCache(_TimedCache[_KT, _VT, _TT]):
     def __init__(
         self,
         maxsize: float,
-        ttl: Any,  # FIXME: must be "addable" to _TT
+        ttl: Any,
         timer: Callable[[], _TT],
         getsizeof: Callable[[_VT], float] | None = None,
     ) -> None: ...
@@ -133,6 +136,29 @@ class TLRUCache(_TimedCache[_KT, _VT, _TT]):
     def ttu(self) -> Callable[[_KT, _VT, _TT], _TT]: ...
     def expire(self, time: _TT | None = None) -> list[tuple[_KT, _VT]]: ...
 
+@overload
+def create_cache(
+    maxsize: float,
+    ttl: None = None,
+    *,
+    getsizeof: Callable[[_VT2], float] | None = None,
+) -> LRUCache[_KT2, _VT2]: ...
+@overload
+def create_cache(
+    maxsize: float,
+    ttl: float,
+    *,
+    getsizeof: Callable[[_VT2], float] | None = None,
+) -> TTLCache[_KT2, _VT2, float]: ...
+@overload
+def create_cache(
+    maxsize: float,
+    ttl: Any,
+    *,
+    timer: Callable[[], _TT],
+    getsizeof: Callable[[_VT], float] | None = None,
+) -> TTLCache[_KT, _VT, _TT]: ...
+
 class _CacheInfo(NamedTuple):
     hits: int
     misses: int
@@ -141,7 +167,6 @@ class _CacheInfo(NamedTuple):
 
 @type_check_only
 class _AbstractCondition(AbstractContextManager[Any], Protocol):
-    # implementation and unit tests do not use plain wait() and notify()
     def wait(self, timeout: float | None = None) -> bool: ...
     def wait_for(
         self, predicate: Callable[[], _T], timeout: float | None = None

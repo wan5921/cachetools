@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import Mock
 
 from cachetools import TTLCache
 
@@ -228,20 +229,34 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
         self.assertEqual(0, len(cache))
         self.assertEqual(0, cache.currsize)
 
-        # verify LRU eviction order is reset after clear
         cache[3] = 3
         cache[4] = 4
-        cache[3]  # access 3 to make it most recently used
-        cache[5] = 5  # should evict 4 (least recently used)
+        cache[3]
+        cache[5] = 5
 
         self.assertEqual(2, len(cache))
         self.assertIn(3, cache)
         self.assertIn(5, cache)
         self.assertNotIn(4, cache)
 
-        # verify TTL expiry still works after clear
         cache[42] = 42
         cache.timer.tick()
         cache.timer.tick()
-        cache.timer.tick()  # past TTL
+        cache.timer.tick()
         self.assertNotIn(42, cache)
+
+    def test_get_or_compute_reloads_after_expiration(self):
+        cache = TTLCache[str, int, int](maxsize=2, ttl=1, timer=Timer())
+        compute = Mock(side_effect=[100, 200])
+
+        self.assertEqual(100, cache.get_or_compute("answer", compute))
+        self.assertEqual(100, cache.get_or_compute("answer", compute))
+        compute.assert_called_once_with()
+
+        cache.timer.tick()
+        self.assertEqual([("answer", 100)], cache.cleanup())
+        self.assertNotIn("answer", cache)
+
+        self.assertEqual(200, cache.get_or_compute("answer", compute))
+        self.assertEqual(2, compute.call_count)
+        self.assertEqual(200, cache["answer"])

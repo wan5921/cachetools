@@ -10,6 +10,7 @@ __all__ = (
     "TTLCache",
     "cached",
     "cachedmethod",
+    "create_cache",
 )
 
 __version__ = "7.1.4"
@@ -134,6 +135,17 @@ class Cache(collections.abc.MutableMapping):
             self[key] = value = default
         return value
 
+    def get_or_compute(self, key, compute_func):
+        try:
+            return self[key]
+        except KeyError:
+            value = compute_func()
+            self[key] = value
+            return value
+
+    def cleanup(self):
+        return []
+
     # Although the MutableMapping.clear() default implementation works
     # perfectly well, it calls popitem() in a loop until the cache is
     # empty, resulting in O(n) complexity.  For large caches, this
@@ -249,7 +261,7 @@ class LFUCache(Cache):
         curr = root.next
         if curr is root:
             raise KeyError("%s is empty" % type(self).__name__) from None
-        key = next(iter(curr.keys))  # remove an arbitrary element
+        key = next(iter(curr.keys))
         return (key, self.pop(key))
 
     def clear(self):
@@ -259,7 +271,6 @@ class LFUCache(Cache):
         self.__links.clear()
 
     def __touch(self, key):
-        """Increment use count"""
         link = self.__links[key]
         curr = link.next
         if curr.count != link.count + 1:
@@ -286,7 +297,7 @@ class LRUCache(Cache):
 
     def __getitem__(self, key, cache_getitem=Cache.__getitem__):
         value = cache_getitem(self, key)
-        if key in self:  # __missing__ may not store item
+        if key in self:
             self.__touch(key)
         return value
 
@@ -312,7 +323,6 @@ class LRUCache(Cache):
         self.__order.clear()
 
     def __touch(self, key):
-        """Mark as recently used"""
         try:
             self.__order.move_to_end(key)
         except KeyError:
@@ -431,13 +441,14 @@ class _TimedCache(Cache):
         with self.__timer:
             return Cache.setdefault(self, *args, **kwargs)
 
+    def cleanup(self):
+        with self.__timer as time:
+            return self.expire(time)
+
     def clear(self):
-        # Subclasses must override to also reset their own time-tracking
-        # structures; we do not call expire() here since clear() should
-        # be O(1) regardless of cache contents.
         Cache.clear(self)
 
-    def expire(self, time=None):  # pragma: no cover
+    def expire(self, time=None):
         raise NotImplementedError
 
 
@@ -469,7 +480,7 @@ class TTLCache(_TimedCache):
 
     def __contains__(self, key):
         try:
-            link = self.__links[key]  # no reordering
+            link = self.__links[key]
         except KeyError:
             return False
         else:
@@ -513,7 +524,6 @@ class TTLCache(_TimedCache):
         root = self.__root
         curr = root.next
         while curr is not root:
-            # "freeze" time for iterator access
             with self.timer as time:
                 if time < curr.expires:
                     yield curr.key
@@ -585,7 +595,7 @@ class TTLCache(_TimedCache):
 class TLRUCache(_TimedCache):
     """Time aware Least Recently Used (TLRU) cache implementation."""
 
-    __HEAP_CLEANUP_FACTOR = 2  # clean up the heap if size > N * len(items)
+    __HEAP_CLEANUP_FACTOR = 2
 
     @functools.total_ordering
     class _Item:
@@ -607,7 +617,7 @@ class TLRUCache(_TimedCache):
 
     def __contains__(self, key):
         try:
-            item = self.__items[key]  # no reordering
+            item = self.__items[key]
         except KeyError:
             return False
         else:
@@ -629,11 +639,9 @@ class TLRUCache(_TimedCache):
         with self.timer as time:
             expires = self.__ttu(key, value, time)
             if not (time < expires):
-                return  # skip expired items
+                return
             self.expire(time)
             cache_setitem(self, key, value)
-        # removing an existing item would break the heap structure, so
-        # only mark it as removed for now
         try:
             self.__getitem(key).removed = True
         except KeyError:
@@ -643,7 +651,6 @@ class TLRUCache(_TimedCache):
 
     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
         with self.timer as time:
-            # no self.expire() for performance reasons, e.g. self.clear() [#67]
             cache_delitem(self, key)
         item = self.__items.pop(key)
         item.removed = True
@@ -652,7 +659,6 @@ class TLRUCache(_TimedCache):
 
     def __iter__(self):
         for curr in self.__order:
-            # "freeze" time for iterator access
             with self.timer as time:
                 if time < curr.expires and not curr.removed:
                     yield curr.key
@@ -671,7 +677,6 @@ class TLRUCache(_TimedCache):
             time = self.timer()
         items = self.__items
         order = self.__order
-        # clean up the heap if too many items are marked as removed
         if len(order) > len(items) * self.__HEAP_CLEANUP_FACTOR:
             self.__order = order = [item for item in order if not item.removed]
             heapq.heapify(order)
@@ -711,11 +716,15 @@ class TLRUCache(_TimedCache):
         return value
 
 
-# note that the runtime __name__ is "CacheInfo", as in stdlib:
-# https://github.com/python/cpython/blob/3.14/Lib/functools.py#L520
 _CacheInfo = collections.namedtuple(
     "CacheInfo", ["hits", "misses", "maxsize", "currsize"]
 )
+
+
+def create_cache(maxsize, ttl=None, timer=time.monotonic, getsizeof=None):
+    if ttl is None:
+        return LRUCache(maxsize=maxsize, getsizeof=getsizeof)
+    return TTLCache(maxsize=maxsize, ttl=ttl, timer=timer, getsizeof=getsizeof)
 
 
 def cached(cache, key=keys.hashkey, lock=None, condition=None, info=False):
