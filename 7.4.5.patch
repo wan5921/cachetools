@@ -1,0 +1,124 @@
+diff --git a/src/cachetools/__init__.py b/src/cachetools/__init__.py
+index 1b299c5..bdb6ec0 100644
+--- a/src/cachetools/__init__.py
++++ b/src/cachetools/__init__.py
+@@ -196,85 +196,68 @@ class FIFOCache(Cache):
+ class LFUCache(Cache):
+     """Least Frequently Used (LFU) cache implementation."""
+ 
+-    class _Link:
+-        __slots__ = ("count", "keys", "next", "prev")
++    _HEAP_CLEANUP_FACTOR = 2
++
++    class _Item:
++        __slots__ = ("key", "count", "removed")
+ 
+-        def __init__(self, count):
++        def __init__(self, key, count):
++            self.key = key
+             self.count = count
+-            self.keys = set()
++            self.removed = False
+ 
+-        def unlink(self):
+-            next = self.next
+-            prev = self.prev
+-            prev.next = next
+-            next.prev = prev
++        def __lt__(self, other):
++            return self.count < other.count
+ 
+     def __init__(self, maxsize, getsizeof=None):
+         Cache.__init__(self, maxsize, getsizeof)
+-        self.__root = root = LFUCache._Link(0)  # sentinel
+-        root.prev = root.next = root
+-        self.__links = {}
++        self.__items = {}
++        self.__heap = []
+ 
+     def __getitem__(self, key, cache_getitem=Cache.__getitem__):
+         value = cache_getitem(self, key)
+-        if key in self:  # __missing__ may not store item
++        if key in self:
+             self.__touch(key)
+         return value
+ 
+     def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+         cache_setitem(self, key, value)
+-        if key in self.__links:
++        if key in self.__items:
+             self.__touch(key)
+             return
+-        root = self.__root
+-        link = root.next
+-        if link.count != 1:
+-            link = LFUCache._Link(1)
+-            link.next = root.next
+-            root.next = link.next.prev = link
+-            link.prev = root
+-        link.keys.add(key)
+-        self.__links[key] = link
++        item = LFUCache._Item(key, 1)
++        self.__items[key] = item
++        heapq.heappush(self.__heap, item)
+ 
+     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+         cache_delitem(self, key)
+-        link = self.__links.pop(key)
+-        link.keys.remove(key)
+-        if not link.keys:
+-            link.unlink()
++        item = self.__items.pop(key)
++        item.removed = True
+ 
+     def popitem(self):
+         """Remove and return the `(key, value)` pair least frequently used."""
+-        root = self.__root
+-        curr = root.next
+-        if curr is root:
+-            raise KeyError("%s is empty" % type(self).__name__) from None
+-        key = next(iter(curr.keys))  # remove an arbitrary element
+-        return (key, self.pop(key))
++        if len(self.__heap) > len(self.__items) * self._HEAP_CLEANUP_FACTOR:
++            self.__heap = [item for item in self.__heap if not item.removed]
++            heapq.heapify(self.__heap)
++        while self.__heap:
++            item = heapq.heappop(self.__heap)
++            if not item.removed:
++                key = item.key
++                return (key, self.pop(key))
++        raise KeyError("%s is empty" % type(self).__name__) from None
+ 
+     def clear(self):
+         Cache.clear(self)
+-        root = self.__root
+-        root.prev = root.next = root
+-        self.__links.clear()
++        self.__items.clear()
++        self.__heap.clear()
+ 
+     def __touch(self, key):
+         """Increment use count"""
+-        link = self.__links[key]
+-        curr = link.next
+-        if curr.count != link.count + 1:
+-            if len(link.keys) == 1:
+-                link.count += 1
+-                return
+-            curr = LFUCache._Link(link.count + 1)
+-            curr.next = link.next
+-            link.next = curr.next.prev = curr
+-            curr.prev = link
+-        curr.keys.add(key)
+-        link.keys.remove(key)
+-        if not link.keys:
+-            link.unlink()
+-        self.__links[key] = curr
++        old_item = self.__items[key]
++        old_item.removed = True
++        new_item = LFUCache._Item(key, old_item.count + 1)
++        self.__items[key] = new_item
++        heapq.heappush(self.__heap, new_item)
+ 
+ 
+ class LRUCache(Cache):
