@@ -1,0 +1,99 @@
+diff --git a/tests/test_ttl.py b/tests/test_ttl.py
+index e023173..0d22000 100644
+--- a/tests/test_ttl.py
++++ b/tests/test_ttl.py
+@@ -1,10 +1,15 @@
+ import math
+ import unittest
+ 
+-from cachetools import TTLCache
++from cachetools import Cache, TTLCache
+ 
+ from . import CacheTestMixin
+ 
++try:
++    import time_machine
++except ImportError:
++    time_machine = None
++
+ 
+ class Timer:
+     def __init__(self, auto=False):
+@@ -25,6 +30,11 @@ class TTLTestCache(TTLCache):
+         TTLCache.__init__(self, maxsize, ttl=ttl, timer=Timer(), **kwargs)
+ 
+ 
++class MissingNoneTTLCache(TTLCache):
++    def __missing__(self, key):
++        return None
++
++
+ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
+     Cache = TTLTestCache
+ 
+@@ -218,6 +228,47 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
+         self.assertEqual([(1, 1)], list(items))
+         self.assertEqual(0, len(cache))
+ 
++    @unittest.skipIf(time_machine is None, "time-machine not installed")
++    def test_ttl_time_machine_lazy_expire_until_write(self):
++        from datetime import datetime, timedelta
++
++        with time_machine.travel(datetime(2024, 1, 1, 0, 0, 0), tick=False) as traveller:
++            cache = TTLCache[str, int, datetime](
++                maxsize=2, ttl=timedelta(seconds=5), timer=datetime.now
++            )
++
++            cache["a"] = 1
++            self.assertEqual(1, Cache.__len__(cache))
++
++            traveller.shift(timedelta(seconds=6))
++
++            self.assertEqual(1, Cache.__len__(cache))
++            cache["b"] = 2
++            self.assertEqual(1, Cache.__len__(cache))
++            self.assertNotIn("a", cache)
++            self.assertEqual(2, cache["b"])
++
++    @unittest.skipIf(time_machine is None, "time-machine not installed")
++    def test_ttl_time_machine_getitem_missing_then_compact(self):
++        from datetime import datetime, timedelta
++
++        with time_machine.travel(datetime(2024, 1, 1, 0, 0, 0), tick=False) as traveller:
++            cache = MissingNoneTTLCache[str, int, datetime](
++                maxsize=1, ttl=timedelta(seconds=5), timer=datetime.now
++            )
++
++            cache["a"] = 1
++            traveller.shift(timedelta(seconds=6))
++
++            self.assertEqual(1, Cache.__len__(cache))
++            self.assertEqual(1, Cache.currsize.fget(cache))
++            self.assertIsNone(cache["a"])
++            self.assertEqual(1, Cache.__len__(cache))
++            self.assertEqual(1, Cache.currsize.fget(cache))
++            self.assertEqual(0, len(cache))
++            self.assertEqual(0, cache.currsize)
++            self.assertEqual(0, Cache.__len__(cache))
++
+     def test_ttl_clear(self):
+         cache = TTLCache[int, int, int](maxsize=2, ttl=2, timer=Timer())
+ 
+@@ -231,8 +282,8 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
+         # verify LRU eviction order is reset after clear
+         cache[3] = 3
+         cache[4] = 4
+-        cache[3]  # access 3 to make it most recently used
+-        cache[5] = 5  # should evict 4 (least recently used)
++        cache[3]
++        cache[5] = 5
+ 
+         self.assertEqual(2, len(cache))
+         self.assertIn(3, cache)
+@@ -243,5 +294,5 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
+         cache[42] = 42
+         cache.timer.tick()
+         cache.timer.tick()
+-        cache.timer.tick()  # past TTL
++        cache.timer.tick()
+         self.assertNotIn(42, cache)
