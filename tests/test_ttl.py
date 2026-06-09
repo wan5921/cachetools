@@ -1,4 +1,6 @@
 import math
+import threading
+import time
 import unittest
 
 from cachetools import TTLCache
@@ -245,3 +247,176 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
         cache.timer.tick()
         cache.timer.tick()  # past TTL
         self.assertNotIn(42, cache)
+
+
+class TTLCacheConcurrencyTest(unittest.TestCase):
+    """Test cases to verify TTLCache thread-safety and proper expiry handling
+    under concurrent access."""
+
+    NTHREADS = 20
+    TIMEOUT = 30
+
+    def test_concurrent_read_write(self):
+        """Verify that concurrent reads and writes do not corrupt the cache."""
+        cache = TTLCache(maxsize=1000, ttl=1.0)
+        errors = []
+
+        def writer(tid):
+            try:
+                for i in range(100):
+                    key = f"key-{tid}-{i}"
+                    cache[key] = i
+            except Exception as e:
+                errors.append(e)
+
+        def reader(tid):
+            try:
+                for i in range(100):
+                    key = f"key-{tid % 5}-{i}"
+                    try:
+                        _ = cache[key]
+                    except KeyError:
+                        pass  # expected for keys that don't exist yet
+                    _ = len(cache)
+                    _ = f"key-{tid}-{i}" in cache
+            except Exception as e:
+                errors.append(e)
+
+        threads = []
+        for i in range(self.NTHREADS):
+            if i % 2 == 0:
+                threads.append(threading.Thread(target=writer, args=(i,)))
+            else:
+                threads.append(threading.Thread(target=reader, args=(i,)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=self.TIMEOUT)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual([], errors, f"Concurrency errors: {errors}")
+
+    def test_expiry_returns_keyerror(self):
+        """Verify that accessing an expired key raises KeyError."""
+        cache = TTLCache(maxsize=10, ttl=0.05)
+        cache["foo"] = "bar"
+        self.assertEqual("bar", cache["foo"])
+
+        time.sleep(0.1)
+
+        with self.assertRaises(KeyError):
+            _ = cache["foo"]
+
+        self.assertNotIn("foo", cache)
+
+    def test_expired_item_removed_on_read(self):
+        """Verify that expired items are actually removed from the cache when
+        accessed via __getitem__, not just when __setitem__ is called."""
+        cache = TTLCache(maxsize=10, ttl=0.05)
+
+        cache["a"] = 1
+        cache["b"] = 2
+        cache["c"] = 3
+        self.assertEqual(3, len(cache))
+
+        time.sleep(0.1)
+
+        with self.assertRaises(KeyError):
+            _ = cache["a"]
+
+        self.assertEqual(0, len(cache),
+                         "Expired items should be removed on read, not just on write")
+        self.assertNotIn("a", cache)
+        self.assertNotIn("b", cache)
+        self.assertNotIn("c", cache)
+
+    def test_concurrent_expiry(self):
+        """Verify that concurrent access during expiry window correctly raises
+        KeyError for expired keys."""
+        cache = TTLCache(maxsize=100, ttl=0.05)
+        keyerrors_reported = []
+        unexpected_values = []
+        errors = []
+
+        for i in range(50):
+            cache[f"key-{i}"] = i
+
+        time.sleep(0.1)
+
+        def access_expired(tid):
+            try:
+                key = f"key-{tid % 50}"
+                try:
+                    val = cache[key]
+                    unexpected_values.append((key, val))
+                except KeyError:
+                    keyerrors_reported.append(key)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=access_expired, args=(i,))
+            for i in range(self.NTHREADS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=self.TIMEOUT)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual([], errors, f"Concurrency errors: {errors}")
+        self.assertEqual(
+            [], unexpected_values,
+            f"Expired keys should not return values: {unexpected_values}"
+        )
+        self.assertTrue(
+            len(keyerrors_reported) > 0,
+            "At least some expired accesses should raise KeyError"
+        )
+        self.assertEqual(0, len(cache), "Cache should be empty after expiry")
+
+    def test_concurrent_write_and_expire(self):
+        """Verify that concurrent writes during natural expiry maintain
+        consistency."""
+        cache = TTLCache(maxsize=100, ttl=0.02)
+        errors = []
+        barrier = threading.Barrier(self.NTHREADS)
+
+        def worker(tid):
+            try:
+                barrier.wait(timeout=self.TIMEOUT)
+                for i in range(50):
+                    key = f"k-{tid}-{i}"
+                    cache[key] = i
+                    try:
+                        _ = cache[key]
+                    except KeyError:
+                        pass
+                    _ = len(cache)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=worker, args=(i,))
+            for i in range(self.NTHREADS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=self.TIMEOUT)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual([], errors, f"Concurrency errors: {errors}")
+        self.assertTrue(len(cache) >= 0)
+        for key in list(cache):
+            self.assertIn(key, cache)
+
+    def test_lock_attribute_exists(self):
+        """Verify that TTLCache exposes a _lock attribute for external
+        synchronization if needed."""
+        cache = TTLCache(maxsize=10, ttl=1.0)
+        self.assertTrue(hasattr(cache, "_lock"))
+
+
+if __name__ == "__main__":
+    unittest.main()
