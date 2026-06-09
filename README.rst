@@ -5,7 +5,7 @@ cachetools
    :target: https://pypi.org/project/cachetools/
    :alt: Latest PyPI version
 
-.. image:: https://img.shields.io/github/actions/workflow/status/tkem/cachetools/ci.yml
+.. image:: https://img.shields.io/github/actions/workflow/status/tkem/cachetools/ci.yml?branch=main
    :target: https://github.com/tkem/cachetools/actions/workflows/ci.yml
    :alt: CI build status
 
@@ -13,7 +13,7 @@ cachetools
    :target: https://cachetools.readthedocs.io/
    :alt: Documentation build status
 
-.. image:: https://img.shields.io/codecov/c/github/tkem/cachetools/master.svg
+.. image:: https://img.shields.io/codecov/c/github/tkem/cachetools?logo=codecov
    :target: https://codecov.io/gh/tkem/cachetools
    :alt: Test coverage
 
