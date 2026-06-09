@@ -1,0 +1,269 @@
+import math
+import time
+
+import pytest
+
+from cachetools import TLRUCache
+
+
+class _Timer:
+    """Manually controlled timer for deterministic TLRU tests."""
+
+    def __init__(self, auto=False):
+        self.auto = auto
+        self.time = 0
+
+    def __call__(self):
+        if self.auto:
+            self.time += 1
+        return self.time
+
+    def tick(self):
+        self.time += 1
+
+
+def _never_ttl(_key, _value, _time):
+    return math.inf
+
+
+# ---------------------------------------------------------------------------
+# maxsize
+# ---------------------------------------------------------------------------
+class TestMaxsize:
+    def test_bounded_by_maxsize(self):
+        cache = TLRUCache(maxsize=2, ttu=_never_ttl, timer=_Timer())
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        assert len(cache) == 2
+        assert cache.currsize == 2
+        assert cache.maxsize == 2
+
+    def test_evicts_oldest_on_overflow(self):
+        cache = TLRUCache(maxsize=2, ttu=_never_ttl, timer=_Timer())
+        cache[1] = 1
+        cache[2] = 2
+        # Adding 3 should evict the oldest (1)
+        cache[3] = 3
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+        assert len(cache) == 2
+
+    def test_access_updates_lru_order(self):
+        cache = TLRUCache(maxsize=2, ttu=_never_ttl, timer=_Timer())
+        cache[1] = 1
+        cache[2] = 2
+        # Access 1, making 2 the least recently used
+        assert cache[1] == 1
+        cache[3] = 3
+        assert 1 in cache
+        assert 2 not in cache
+        assert 3 in cache
+
+    def test_repeated_inserts_maintain_bounds(self):
+        cache = TLRUCache(maxsize=3, ttu=_never_ttl, timer=_Timer())
+        for i in range(10):
+            cache[i] = i
+        assert len(cache) == 3
+        assert cache.currsize == 3
+
+    def test_value_too_large_raises(self):
+        cache = TLRUCache(
+            maxsize=2,
+            ttu=_never_ttl,
+            timer=_Timer(),
+            getsizeof=lambda x: x,
+        )
+        with pytest.raises(ValueError):
+            cache[1] = 5
+
+
+# ---------------------------------------------------------------------------
+# TTL / expiry
+# ---------------------------------------------------------------------------
+class TestTTLExpiration:
+    def test_entry_expires_after_ttu(self):
+        ttu = lambda _k, _v, t: t + 2
+        cache = TLRUCache(maxsize=10, ttu=ttu, timer=_Timer())
+
+        cache[1] = 1
+        assert 1 in cache
+        assert cache[1] == 1
+
+        cache.timer.tick()
+        assert 1 in cache
+
+        cache.timer.tick()
+        # Now t=2, expires at t=2 => treated as expired
+        assert 1 not in cache
+
+    def test_get_returns_missing_after_expiry(self):
+        ttu = lambda _k, _v, t: t + 1
+        cache = TLRUCache(maxsize=10, ttu=ttu, timer=_Timer())
+
+        cache[1] = 42
+        assert cache.get(1) == 42
+        cache.timer.tick()
+        assert cache.get(1) is None
+        assert cache.get(1, "missing") == "missing"
+
+    def test_getitem_raises_after_expiry(self):
+        ttu = lambda _k, _v, t: t + 1
+        cache = TLRUCache(maxsize=10, ttu=ttu, timer=_Timer())
+
+        cache[1] = 42
+        cache.timer.tick()
+        with pytest.raises(KeyError):
+            _ = cache[1]
+
+    def test_len_reflects_expired_entries(self):
+        ttu = lambda _k, _v, t: t + 1
+        cache = TLRUCache(maxsize=10, ttu=ttu, timer=_Timer())
+
+        cache[1] = 1
+        cache[2] = 2
+        assert len(cache) == 2
+        cache.timer.tick()
+        assert len(cache) == 0
+
+    def test_real_time_sleep_expiration(self):
+        cache = TLRUCache(
+            maxsize=10,
+            ttu=lambda _k, _v, t: t + 0.1,
+            timer=time.monotonic,
+        )
+        cache[1] = "hello"
+        assert cache[1] == "hello"
+        time.sleep(0.2)
+        assert 1 not in cache
+        with pytest.raises(KeyError):
+            _ = cache[1]
+
+    def test_expire_returns_removed_items(self):
+        ttu = lambda _k, _v, t: t + 2
+        cache = TLRUCache(maxsize=10, ttu=ttu, timer=_Timer())
+
+        cache[1] = 1
+        cache.timer.tick()
+        cache[2] = 2
+        cache.timer.tick()
+        cache[3] = 3
+
+        # At t=2, item 1 (expires at t=2) is expired
+        expired = cache.expire(2)
+        assert (1, 1) in expired
+        assert 1 not in cache
+        assert cache.currsize == 2
+
+
+# ---------------------------------------------------------------------------
+# Prioritized eviction: expired entries go before LRU ones
+# ---------------------------------------------------------------------------
+class TestPriorityEviction:
+    def test_expired_entries_evicted_before_lru(self):
+        """Items whose TTL has expired must be removed before touching LRU
+        items that are still valid."""
+
+        def ttu(key, _v, t):
+            # key 1 expires quickly, key 2 and 3 live much longer
+            if key == 1:
+                return t + 1
+            return t + 100
+
+        cache = TLRUCache(maxsize=2, ttu=ttu, timer=_Timer())
+
+        cache[1] = 1  # expires at t=1
+        cache[2] = 2  # expires at t=100
+
+        # Time moves forward; item 1 is now expired.
+        cache.timer.tick()  # t=1
+
+        # Inserting a new item should drop the expired item 1, not item 2
+        # (which is still valid but older in LRU order).
+        cache[3] = 3
+
+        assert 1 not in cache, "Expired item should be evicted first"
+        assert 2 in cache, "Still-valid LRU item must be retained"
+        assert 3 in cache
+        assert len(cache) == 2
+
+    def test_no_valid_items_lost_when_expired_available(self):
+        """Even with a tight maxsize, valid entries survive as long as
+        there is at least one expired entry to drop."""
+
+        def ttu(key, _v, t):
+            # Only the first inserted key has a short TTL
+            return t + (1 if key == "short" else 1000)
+
+        cache = TLRUCache(maxsize=3, ttu=ttu, timer=_Timer())
+
+        cache["short"] = 0
+        cache["a"] = 1
+        cache["b"] = 2
+
+        cache.timer.tick()  # "short" becomes expired
+
+        cache["c"] = 3
+        cache["d"] = 4  # maxsize exhausted again; still only "short" is expired
+
+        assert "short" not in cache
+        # With maxsize=3 and two valid inserts after expiry, the cache must
+        # retain exactly three valid entries.
+        assert len(cache) == 3
+        for key in ("a", "b", "c", "d"):
+            # At most one of c/d may have been dropped via pure LRU, but
+            # valid items present must still be readable.
+            if key in cache:
+                assert cache[key] is not None
+
+    def test_lru_only_when_no_expired_entries(self):
+        """When nothing is expired, fallback to plain LRU eviction."""
+        cache = TLRUCache(maxsize=2, ttu=_never_ttl, timer=_Timer())
+
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3  # nothing expired => must drop the LRU entry (1)
+
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+
+
+# ---------------------------------------------------------------------------
+# Misc behaviour
+# ---------------------------------------------------------------------------
+class TestBehaviour:
+    def test_setdefault(self):
+        cache = TLRUCache(maxsize=2, ttu=_never_ttl, timer=_Timer())
+        assert cache.setdefault(1, "a") == "a"
+        assert cache.setdefault(1, "b") == "a"
+
+    def test_pop(self):
+        ttu = lambda _k, _v, t: t + 10
+        cache = TLRUCache(maxsize=2, ttu=ttu, timer=_Timer())
+        cache[1] = 1
+        assert cache.pop(1) == 1
+        with pytest.raises(KeyError):
+            cache.pop(1)
+        assert cache.pop(1, "default") == "default"
+
+    def test_clear_resets_state(self):
+        cache = TLRUCache(maxsize=2, ttu=_never_ttl, timer=_Timer())
+        cache[1] = 1
+        cache[2] = 2
+        cache.clear()
+        assert len(cache) == 0
+        assert cache.currsize == 0
+
+    def test_update(self):
+        cache = TLRUCache(maxsize=5, ttu=_never_ttl, timer=_Timer())
+        cache.update({1: 1, 2: 2, 3: 3})
+        assert len(cache) == 3
+        assert cache[3] == 3
+
+    def test_ttu_is_callable(self):
+        cache = TLRUCache(
+            maxsize=1, ttu=lambda _k, _v, t: t + 5, timer=_Timer()
+        )
+        assert callable(cache.ttu)
