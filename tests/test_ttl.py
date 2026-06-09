@@ -22,6 +22,21 @@ class Timer:
         self.time += 1
 
 
+class ThreadSafeTimer:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.time = 0
+
+    def __call__(self):
+        with self._lock:
+            return self.time
+
+    def tick(self, delta=1):
+        with self._lock:
+            self.time += delta
+            return self.time
+
+
 class TTLTestCache(TTLCache):
     def __init__(self, maxsize, ttl=math.inf, **kwargs):
         TTLCache.__init__(self, maxsize, ttl=ttl, timer=Timer(), **kwargs)
@@ -410,6 +425,64 @@ class TTLCacheConcurrencyTest(unittest.TestCase):
         self.assertTrue(len(cache) >= 0)
         for key in list(cache):
             self.assertIn(key, cache)
+
+    def test_concurrent_read_write_after_expiry_raises_keyerror(self):
+        """Verify that expired entries never leak values during concurrent
+        reads, writes, and cleanup."""
+        timer = ThreadSafeTimer()
+        cache = TTLCache(maxsize=512, ttl=2, timer=timer)
+        barrier = threading.Barrier(self.NTHREADS + 1)
+        expired = threading.Event()
+        errors = []
+        stale_reads = []
+
+        cache["shared"] = "value"
+
+        def writer(tid):
+            try:
+                barrier.wait(timeout=self.TIMEOUT)
+                expired.wait(timeout=self.TIMEOUT)
+                for i in range(100):
+                    cache[f"key-{tid}-{i}"] = i
+                    if i % 5 == 0:
+                        cache.expire()
+                    _ = len(cache)
+            except Exception as e:
+                errors.append(e)
+
+        def reader():
+            try:
+                barrier.wait(timeout=self.TIMEOUT)
+                expired.wait(timeout=self.TIMEOUT)
+                for _ in range(50):
+                    try:
+                        stale_reads.append(cache["shared"])
+                    except KeyError:
+                        return
+                stale_reads.append("value-returned-after-expiry")
+            except Exception as e:
+                errors.append(e)
+
+        threads = []
+        for i in range(self.NTHREADS // 2):
+            threads.append(threading.Thread(target=writer, args=(i,)))
+            threads.append(threading.Thread(target=reader))
+        for t in threads:
+            t.start()
+
+        barrier.wait(timeout=self.TIMEOUT)
+        timer.tick(3)
+        expired.set()
+
+        for t in threads:
+            t.join(timeout=self.TIMEOUT)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual([], errors, f"Concurrency errors: {errors}")
+        self.assertEqual([], stale_reads, f"Expired key returned values: {stale_reads}")
+        with self.assertRaises(KeyError):
+            _ = cache["shared"]
+        self.assertNotIn("shared", cache)
 
     def test_lock_attribute_exists(self):
         """Verify that TTLCache exposes a _lock attribute for external

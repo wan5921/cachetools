@@ -471,29 +471,28 @@ class TTLCache(_TimedCache):
 
     def __contains__(self, key):
         with self._lock:
-            try:
-                link = self.__links[key]  # no reordering
-            except KeyError:
-                return False
-            else:
-                return self.timer() < link.expires
+            with self.timer as time:
+                self._expire(time)
+                return key in self.__links
 
     def __getitem__(self, key, cache_getitem=Cache.__getitem__):
         with self._lock:
             with self.timer as time:
-                self.expire(time)
+                self._expire(time)
                 try:
                     link = self.__getlink(key)
+                    value = cache_getitem(self, key)
                 except KeyError:
                     return self.__missing__(key)
                 if not (time < link.expires):
+                    self._expire(time)
                     return self.__missing__(key)
-                return cache_getitem(self, key)
+                return value
 
     def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
         with self._lock:
             with self.timer as time:
-                self.expire(time)
+                self._expire(time)
                 cache_setitem(self, key, value)
             try:
                 link = self.__getlink(key)
@@ -530,7 +529,7 @@ class TTLCache(_TimedCache):
     def __len__(self, cache_len=Cache.__len__):
         with self._lock:
             with self.timer as time:
-                self.expire(time)
+                self._expire(time)
                 return cache_len(self)
 
     def __setstate__(self, state):
@@ -542,7 +541,7 @@ class TTLCache(_TimedCache):
             link.prev = prev = root.prev
             prev.next = root.prev = link
         with self._lock:
-            self.expire(self.timer())
+            self._expire(self.timer())
 
     @property
     def ttl(self):
@@ -553,7 +552,7 @@ class TTLCache(_TimedCache):
     def currsize(self):
         with self._lock:
             with self.timer as time:
-                self.expire(time)
+                self._expire(time)
                 return super().currsize
 
     def get(self, *args, **kwargs):
@@ -576,8 +575,12 @@ class TTLCache(_TimedCache):
         expired `(key, value)` pairs.
 
         """
-        if time is None:
-            time = self.timer()
+        with self._lock:
+            if time is None:
+                time = self.timer()
+            return self._expire(time)
+
+    def _expire(self, time):
         root = self.__root
         curr = root.next
         links = self.__links
@@ -600,7 +603,7 @@ class TTLCache(_TimedCache):
         """
         with self._lock:
             with self.timer as time:
-                self.expire(time)
+                self._expire(time)
                 try:
                     key = next(iter(self.__links))
                 except StopIteration:
@@ -618,7 +621,7 @@ class TTLCache(_TimedCache):
     def __repr__(self, cache_repr=Cache.__repr__):
         with self._lock:
             with self.timer as time:
-                self.expire(time)
+                self._expire(time)
                 return cache_repr(self)
 
     def __getlink(self, key):
