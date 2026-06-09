@@ -1,0 +1,498 @@
+diff --git a/run_tests.py b/run_tests.py
+new file mode 100644
+index 0000000..81aeaa6
+--- /dev/null
++++ b/run_tests.py
+@@ -0,0 +1,9 @@
++import sys
++import unittest
++
++sys.path.insert(0, "src")
++loader = unittest.TestLoader()
++suite = loader.loadTestsFromName("tests.test_smart_cache")
++runner = unittest.TextTestRunner(verbosity=2)
++result = runner.run(suite)
++sys.exit(0 if result.wasSuccessful() else 1)
+diff --git a/src/cachetools/_smoke_smart_cache.py b/src/cachetools/_smoke_smart_cache.py
+new file mode 100644
+index 0000000..18cae04
+--- /dev/null
++++ b/src/cachetools/_smoke_smart_cache.py
+@@ -0,0 +1,53 @@
++"""Inline smoke-test for the :mod:`cachetools.smart_cache` module.
++
++This script exists for manual verification only; the formal test suite
++lives in :mod:`tests.test_smart_cache`.
++
++Run with: ``PYTHONPATH=src python3 src/cachetools/smart_cache.py``
++"""
++
++from cachetools.smart_cache import SmartCache
++
++
++def _smoke_lru():
++    cache = SmartCache(maxsize=3, ttl=None)
++    cache["a"] = 1
++    assert cache.get_or_compute("a", lambda: 99) == 1, "LRU miss unexpectedly called compute"
++    assert cache.get_or_compute("b", lambda: "ok") == "ok"
++    assert cache.cleanup() == 0
++    return True
++
++
++def _smoke_ttl():
++    t = [0.0]
++
++    def timer():
++        return t[0]
++
++    cache = SmartCache(maxsize=3, ttl=10, timer=timer)
++    cache["a"] = 1
++    t[0] = 5.0
++    cache["b"] = 2
++    t[0] = 15.0
++    assert cache.cleanup() == 1
++    assert cache.get("a") is None
++    assert cache["b"] == 2
++    return True
++
++
++def _smoke_hit_calls_once():
++    import unittest.mock
++
++    cache = SmartCache(maxsize=5, ttl=60)
++    func = unittest.mock.Mock(return_value=42)
++    for _ in range(5):
++        assert cache.get_or_compute("k", func) == 42
++    assert func.call_count == 1, func.call_count
++    return True
++
++
++if __name__ == "__main__":
++    assert _smoke_lru()
++    assert _smoke_ttl()
++    assert _smoke_hit_calls_once()
++    print("All smoke assertions passed.")
+diff --git a/src/cachetools/smart_cache.py b/src/cachetools/smart_cache.py
+new file mode 100644
+index 0000000..eeb3084
+--- /dev/null
++++ b/src/cachetools/smart_cache.py
+@@ -0,0 +1,181 @@
++"""Smart cache module with automatic LRU/TTL selection.
++
++This module provides a :class:`SmartCache` that automatically selects
++between an LRU and TTL backend based on the ``ttl`` argument, together
++with a :meth:`SmartCache.get_or_compute` helper for cache-penetration
++protection and an explicit :meth:`SmartCache.cleanup` method.
++"""
++
++__all__ = ("SmartCache",)
++
++import threading
++from typing import Any, Callable, Optional
++
++from . import LRUCache, TTLCache
++
++
++class SmartCache:
++    """A smart cache that auto-switches between LRU and TTL backends.
++
++    Parameters
++    ----------
++    maxsize:
++        Maximum number of items the cache may hold.
++    ttl:
++        Optional time-to-live (in seconds) for each cached item.  When
++        ``None`` the cache uses a plain :class:`LRUCache`; otherwise a
++        :class:`TTLCache` is used and items automatically expire after
++        ``ttl`` seconds.
++    timer:
++        Timer callable forwarded to :class:`TTLCache`.  Defaults to
++        ``time.monotonic``.
++    getsizeof:
++        Optional size function forwarded to the underlying cache.
++    """
++
++    _sentinel = object()
++
++    def __init__(
++        self,
++        maxsize: int,
++        ttl: Optional[float] = None,
++        *,
++        timer: Optional[Callable[[], float]] = None,
++        getsizeof: Optional[Callable[[Any], int]] = None,
++    ) -> None:
++        if ttl is None:
++            self._backend: Any = (
++                LRUCache(maxsize, getsizeof)
++                if getsizeof is not None
++                else LRUCache(maxsize)
++            )
++            self._ttl: Optional[float] = None
++        else:
++            kwargs: dict = {"ttl": ttl}
++            if timer is not None:
++                kwargs["timer"] = timer
++            if getsizeof is not None:
++                kwargs["getsizeof"] = getsizeof
++            self._backend = TTLCache(maxsize, **kwargs)
++            self._ttl = float(ttl)
++
++        self._lock = threading.RLock()
++
++    # ------------------------------------------------------------------
++    # Basic mapping interface
++    # ------------------------------------------------------------------
++
++    @property
++    def maxsize(self) -> int:
++        """The maximum number of items this cache can hold."""
++        return self._backend.maxsize
++
++    @property
++    def currsize(self) -> int:
++        """The current number of items in the cache."""
++        return self._backend.currsize
++
++    @property
++    def ttl(self) -> Optional[float]:
++        """The configured TTL, or ``None`` when the cache is LRU-only."""
++        return self._ttl
++
++    @property
++    def backend_type(self) -> str:
++        """Return ``"LRU"`` or ``"TTL"`` depending on the active backend."""
++        return "TTL" if self._ttl is not None else "LRU"
++
++    def __contains__(self, key: Any) -> bool:
++        return key in self._backend
++
++    def __getitem__(self, key: Any) -> Any:
++        return self._backend[key]
++
++    def __setitem__(self, key: Any, value: Any) -> None:
++        self._backend[key] = value
++
++    def __delitem__(self, key: Any) -> None:
++        del self._backend[key]
++
++    def __len__(self) -> int:
++        return len(self._backend)
++
++    def __iter__(self):
++        return iter(self._backend)
++
++    def __repr__(self) -> str:
++        return "SmartCache(maxsize=%r, ttl=%r, items=%r)" % (
++            self.maxsize,
++            self._ttl,
++            dict(self._backend),
++        )
++
++    def get(self, key: Any, default: Any = None) -> Any:
++        return self._backend.get(key, default)
++
++    def pop(self, key: Any, default: Any = _sentinel) -> Any:
++        if default is SmartCache._sentinel:
++            return self._backend.pop(key)
++        return self._backend.pop(key, default)
++
++    def setdefault(self, key: Any, default: Any = None) -> Any:
++        return self._backend.setdefault(key, default)
++
++    def clear(self) -> None:
++        """Remove all items from the cache."""
++        self._backend.clear()
++
++    # ------------------------------------------------------------------
++    # Smart helpers
++    # ------------------------------------------------------------------
++
++    def get_or_compute(
++        self,
++        key: Any,
++        compute_func: Callable[[], Any],
++        *,
++        force: bool = False,
++    ) -> Any:
++        """Return the cached ``key`` or compute and store it on miss.
++
++        This method provides protection against cache penetration
++        (a.k.a. "thundering herd") by serializing calls to
++        ``compute_func`` under a lock: concurrent misses for the same
++        key only trigger a single recomputation.
++
++        Parameters
++        ----------
++        key:
++            The lookup key.
++        compute_func:
++            A zero-argument callable producing the value to cache.
++        force:
++            When ``True`` recompute the value even if it is already
++            cached, replacing the previously stored value.
++        """
++        if not force:
++            existing = self._backend.get(key, SmartCache._sentinel)
++            if existing is not SmartCache._sentinel:
++                return existing
++
++        with self._lock:
++            existing = self._backend.get(key, SmartCache._sentinel)
++            if not force and existing is not SmartCache._sentinel:
++                return existing
++            value = compute_func()
++            self._backend[key] = value
++            return value
++
++    def cleanup(self) -> int:
++        """Manually remove all expired items from the cache.
++
++        Returns
++        -------
++        int
++            The number of items that were removed.  For LRU caches no
++            item ever expires, so the return value is always ``0``.
++        """
++        if self._ttl is None:
++            return 0
++        expired = self._backend.expire()
++        return len(expired)
+diff --git a/tests/test_smart_cache.py b/tests/test_smart_cache.py
+new file mode 100644
+index 0000000..49c5a04
+--- /dev/null
++++ b/tests/test_smart_cache.py
+@@ -0,0 +1,231 @@
++"""Unit tests for :mod:`cachetools.smart_cache`."""
++
++import time
++import threading
++import unittest
++import unittest.mock
++
++from cachetools.smart_cache import SmartCache
++
++
++class SmartCacheTypeSelectionTests(unittest.TestCase):
++    """Tests for automatic LRU/TTL selection based on ``ttl``."""
++
++    def test_lru_when_ttl_is_none(self):
++        cache = SmartCache(maxsize=10, ttl=None)
++        self.assertEqual(cache.backend_type, "LRU")
++        self.assertIsNone(cache.ttl)
++
++    def test_ttl_when_ttl_is_set(self):
++        cache = SmartCache(maxsize=10, ttl=5)
++        self.assertEqual(cache.backend_type, "TTL")
++        self.assertEqual(cache.ttl, 5.0)
++
++    def test_ttl_zero_uses_ttl_backend(self):
++        # ttl=0 explicitly enables TTL mode, even though items expire immediately.
++        cache = SmartCache(maxsize=10, ttl=0)
++        self.assertEqual(cache.backend_type, "TTL")
++
++
++class SmartCacheBasicMappingTests(unittest.TestCase):
++    """Tests that :class:`SmartCache` behaves like a mapping."""
++
++    def test_set_and_get_lru(self):
++        cache = SmartCache(maxsize=2, ttl=None)
++        cache["a"] = 1
++        cache["b"] = 2
++        self.assertEqual(cache["a"], 1)
++        self.assertEqual(cache["b"], 2)
++
++    def test_set_and_get_ttl(self):
++        cache = SmartCache(maxsize=2, ttl=60)
++        cache["a"] = 1
++        cache["b"] = 2
++        self.assertEqual(cache["a"], 1)
++
++    def test_eviction_on_maxsize(self):
++        cache = SmartCache(maxsize=2, ttl=None)
++        cache["a"] = 1
++        cache["b"] = 2
++        cache["c"] = 3
++        self.assertNotIn("a", cache)
++        self.assertIn("b", cache)
++        self.assertIn("c", cache)
++
++    def test_len_and_clear(self):
++        cache = SmartCache(maxsize=5, ttl=60)
++        cache["a"] = 1
++        cache["b"] = 2
++        self.assertEqual(len(cache), 2)
++        cache.clear()
++        self.assertEqual(len(cache), 0)
++
++    def test_get_default(self):
++        cache = SmartCache(maxsize=5)
++        self.assertIsNone(cache.get("missing"))
++        self.assertEqual(cache.get("missing", 42), 42)
++
++    def test_contains(self):
++        cache = SmartCache(maxsize=5, ttl=60)
++        cache["x"] = 1
++        self.assertIn("x", cache)
++        self.assertNotIn("y", cache)
++
++
++class GetOrComputeTests(unittest.TestCase):
++    """Tests for :meth:`SmartCache.get_or_compute`."""
++
++    def test_cache_miss_calls_compute(self):
++        cache = SmartCache(maxsize=5, ttl=None)
++        compute_func = unittest.mock.Mock(return_value="computed")
++
++        result = cache.get_or_compute("k", compute_func)
++
++        self.assertEqual(result, "computed")
++        compute_func.assert_called_once_with()
++
++    def test_cache_hit_skips_compute(self):
++        cache = SmartCache(maxsize=5, ttl=None)
++        cache["k"] = "cached"
++        compute_func = unittest.mock.Mock(return_value="computed")
++
++        result = cache.get_or_compute("k", compute_func)
++
++        self.assertEqual(result, "cached")
++        compute_func.assert_not_called()
++
++    def test_mock_expensive_compute_only_runs_once(self):
++        cache = SmartCache(maxsize=5, ttl=None)
++        compute_func = unittest.mock.Mock(return_value=42)
++
++        first = cache.get_or_compute("k", compute_func)
++        second = cache.get_or_compute("k", compute_func)
++        third = cache.get_or_compute("k", compute_func)
++
++        self.assertEqual(first, 42)
++        self.assertEqual(second, 42)
++        self.assertEqual(third, 42)
++        self.assertEqual(compute_func.call_count, 1)
++
++    def test_mock_expensive_compute_is_slow_only_once(self):
++        cache = SmartCache(maxsize=5, ttl=None)
++
++        # Simulate an "expensive" computation: the mock takes a fake long
++        # time but only runs once on repeated lookups.
++        compute_func = unittest.mock.Mock(return_value="expensive_value")
++
++        start = time.monotonic()
++        first = cache.get_or_compute("key", compute_func)
++        first_elapsed = time.monotonic() - start
++
++        start = time.monotonic()
++        for _ in range(100):
++            cache.get_or_compute("key", compute_func)
++        hits_elapsed = time.monotonic() - start
++
++        self.assertEqual(first, "expensive_value")
++        self.assertEqual(compute_func.call_count, 1)
++        self.assertLess(hits_elapsed, first_elapsed + 0.1)
++
++    def test_force_flag_recomputes(self):
++        cache = SmartCache(maxsize=5, ttl=None)
++        cache["k"] = "old"
++
++        compute_func = unittest.mock.Mock(return_value="new")
++        result = cache.get_or_compute("k", compute_func, force=True)
++
++        self.assertEqual(result, "new")
++        compute_func.assert_called_once_with()
++
++    def test_concurrent_misses_serialize(self):
++        cache = SmartCache(maxsize=5, ttl=None)
++        barrier = threading.Barrier(5)
++        compute_func = unittest.mock.Mock(return_value=100)
++
++        def slow_compute():
++            barrier.wait(timeout=5)
++            return compute_func()
++
++        threads = [
++            threading.Thread(
++                target=lambda: cache.get_or_compute("k", slow_compute)
++            )
++            for _ in range(5)
++        ]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        self.assertEqual(cache["k"], 100)
++        self.assertEqual(compute_func.call_count, 1)
++
++
++class CleanupTests(unittest.TestCase):
++    """Tests for :meth:`SmartCache.cleanup`."""
++
++    def test_cleanup_lru_is_noop(self):
++        cache = SmartCache(maxsize=5, ttl=None)
++        cache["a"] = 1
++        cache["b"] = 2
++        removed = cache.cleanup()
++        self.assertEqual(removed, 0)
++        self.assertEqual(len(cache), 2)
++
++    def test_cleanup_removes_expired_ttl(self):
++        current = [0.0]
++
++        def fake_timer():
++            return current[0]
++
++        cache = SmartCache(maxsize=5, ttl=10, timer=fake_timer)
++        cache["a"] = 1
++        cache["b"] = 2
++        current[0] = 5.0
++        cache["c"] = 3
++
++        # Advance time so a and b have expired but c is still valid.
++        current[0] = 15.0
++        removed = cache.cleanup()
++
++        self.assertEqual(removed, 2)
++        self.assertNotIn("a", cache)
++        self.assertNotIn("b", cache)
++        self.assertIn("c", cache)
++
++    def test_cleanup_with_mock_timer(self):
++        with unittest.mock.patch("cachetools.smart_cache.time.monotonic") as mock_time:
++            mock_time.return_value = 1000.0
++
++            cache = SmartCache(maxsize=5, ttl=5, timer=mock_time)
++            cache["k"] = "value"
++
++            mock_time.return_value = 1004.9
++            self.assertEqual(cache["k"], "value")
++            removed = cache.cleanup()
++            self.assertEqual(removed, 0)
++
++            mock_time.return_value = 1006.0
++            removed = cache.cleanup()
++            self.assertEqual(removed, 1)
++            self.assertNotIn("k", cache)
++
++    def test_cleanup_after_reinsertion(self):
++        current = [0.0]
++
++        def fake_timer():
++            return current[0]
++
++        cache = SmartCache(maxsize=5, ttl=10, timer=fake_timer)
++        cache["k"] = 1
++        current[0] = 5.0
++        cache["k"] = 2  # reinsert, refresh the TTL
++        current[0] = 15.0
++
++        # Original expiry would have passed, but the refresh keeps it alive.
++        removed = cache.cleanup()
++        self.assertEqual(removed, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
