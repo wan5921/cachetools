@@ -1,0 +1,57 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 9d5d8a0..1530a90 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -19,6 +19,7 @@ jobs:
+         with:
+           python-version: ${{ matrix.python }}
+           allow-prereleases: true
++          cache: "pip"
+       - run: pip install coverage tox
+       - run: tox
+       - uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..c7c6aaa
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,20 @@
++FROM python:3.13-slim
++
++ENV PYTHONDONTWRITEBYTECODE=1 \
++    PYTHONUNBUFFERED=1 \
++    PIP_NO_CACHE_DIR=off \
++    PIP_DISABLE_PIP_VERSION_CHECK=1
++
++WORKDIR /app
++
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends build-essential git \
++    && rm -rf /var/lib/apt/lists/*
++
++COPY . .
++
++RUN pip install --upgrade pip \
++    && pip install -e . \
++    && pip install pytest pytest-cov tox
++
++CMD ["tox"]
+diff --git a/tox.ini b/tox.ini
+index 7393b19..1119c1d 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,12 +1,12 @@
+ [tox]
+-envlist = py,docs,doctest,ruff,ruff-format,pyright
++envlist = py310,py311,py312,py313,py314,docs,doctest,ruff,ruff-format,pyright
+ 
+ [testenv]
+ deps =
+     pytest
+     pytest-cov
+ commands =
+-    py.test --basetemp={envtmpdir} --cov=cachetools --cov-report term-missing {posargs}
++    py.test --basetemp={envtmpdir} --cov=cachetools --cov-report term-missing --cov-report xml:coverage.xml {posargs}
+ 
+ [testenv:docs]
+ deps =
