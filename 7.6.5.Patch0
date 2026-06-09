@@ -1,0 +1,778 @@
+diff --git a/generate_report.py b/generate_report.py
+new file mode 100644
+index 0000000..78a4e86
+--- /dev/null
++++ b/generate_report.py
+@@ -0,0 +1,247 @@
++import sys
++import os
++import time
++import threading
++import tracemalloc
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
++
++from cachetools import FIFOCache, LFUCache, LRUCache, RRCache, TTLCache
++
++
++MAXSIZE_VALUES = [100, 1000, 10000]
++CACHE_TYPES = {
++    "LRUCache": LRUCache,
++    "FIFOCache": FIFOCache,
++    "LFUCache": LFUCache,
++    "RRCache": RRCache,
++    "TTLCache": TTLCache,
++}
++
++
++def benchmark_insert(cache_cls, maxsize, rounds=5):
++    times = []
++    for _ in range(rounds):
++        cache = cache_cls(maxsize=maxsize) if cache_cls != TTLCache else cache_cls(maxsize=maxsize, ttl=60)
++        start = time.perf_counter()
++        for i in range(maxsize):
++            cache[i] = i
++        elapsed = time.perf_counter() - start
++        times.append(elapsed)
++    avg = sum(times) / len(times)
++    ops_per_sec = maxsize / avg if avg > 0 else 0
++    return avg, ops_per_sec
++
++
++def benchmark_query(cache_cls, maxsize, rounds=5):
++    cache = cache_cls(maxsize=maxsize) if cache_cls != TTLCache else cache_cls(maxsize=maxsize, ttl=60)
++    for i in range(maxsize):
++        cache[i] = i
++
++    times = []
++    for _ in range(rounds):
++        start = time.perf_counter()
++        for i in range(maxsize):
++            cache.get(i)
++        elapsed = time.perf_counter() - start
++        times.append(elapsed)
++    avg = sum(times) / len(times)
++    ops_per_sec = maxsize / avg if avg > 0 else 0
++    return avg, ops_per_sec
++
++
++def benchmark_mixed(cache_cls, maxsize, rounds=5):
++    cache = cache_cls(maxsize=maxsize) if cache_cls != TTLCache else cache_cls(maxsize=maxsize, ttl=60)
++    for i in range(maxsize):
++        cache[i] = i
++
++    times = []
++    for _ in range(rounds):
++        start = time.perf_counter()
++        for i in range(maxsize):
++            if i % 2 == 0:
++                cache[i] = i * 2
++            else:
++                cache.get(i)
++        elapsed = time.perf_counter() - start
++        times.append(elapsed)
++    avg = sum(times) / len(times)
++    ops_per_sec = maxsize / avg if avg > 0 else 0
++    return avg, ops_per_sec
++
++
++def test_ttl_expiration():
++    results = []
++    cache = TTLCache(maxsize=100, ttl=0.3)
++    for i in range(100):
++        cache[i] = i
++    size_before = cache.currsize
++    time.sleep(0.4)
++    size_after = cache.currsize
++    results.append(("TTL full expire", size_before, size_after, size_after == 0))
++
++    cache = TTLCache(maxsize=100, ttl=0.5)
++    for i in range(50):
++        cache[i] = i
++    time.sleep(0.3)
++    for i in range(50, 100):
++        cache[i] = i
++    size_before = cache.currsize
++    time.sleep(0.3)
++    size_after = cache.currsize
++    results.append(("TTL partial expire", size_before, size_after, size_after == 50))
++
++    return results
++
++
++def test_concurrency():
++    results = []
++    for name, cls in CACHE_TYPES.items():
++        if cls == TTLCache:
++            cache = cls(maxsize=100, ttl=60)
++        else:
++            cache = cls(maxsize=100)
++
++        errors = []
++        nthreads = 10
++        iterations = 500
++
++        def worker(thread_id):
++            try:
++                for i in range(iterations):
++                    key = thread_id * iterations + i
++                    cache[key] = key
++                    cache.get(key)
++            except Exception as e:
++                errors.append(e)
++
++        threads = [threading.Thread(target=worker, args=(tid,)) for tid in range(nthreads)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        passed = len(errors) == 0 and cache.currsize <= cache.maxsize
++        results.append((name, cache.currsize, cache.maxsize, passed, len(errors)))
++
++    return results
++
++
++def test_memory_leak():
++    results = []
++    iterations = 5
++    ops_per_round = 10000
++
++    for name, cls in CACHE_TYPES.items():
++        tracemalloc.start()
++        if cls == TTLCache:
++            cache = cls(maxsize=1000, ttl=60)
++        else:
++            cache = cls(maxsize=1000)
++
++        baseline = tracemalloc.take_snapshot()
++
++        for _ in range(iterations):
++            for i in range(ops_per_round):
++                cache[i % 2000] = i
++
++        end = tracemalloc.take_snapshot()
++        tracemalloc.stop()
++
++        stats = end.compare_to(baseline, "lineno")
++        total_diff_kb = sum(s.size_diff for s in stats) / 1024
++
++        passed = total_diff_kb < 512 and cache.currsize <= cache.maxsize
++        results.append((name, cache.currsize, f"{total_diff_kb:.2f} KB", passed))
++
++    return results
++
++
++def format_table(headers, rows):
++    col_widths = [max(len(str(row[i])) for row in [headers] + rows) for i in range(len(headers))]
++    sep = "+".join("-" * (w + 2) for w in col_widths)
++    sep = "+" + sep + "+"
++
++    def format_row(row):
++        cells = [f" {str(row[i]):<{col_widths[i]}} " for i in range(len(row))]
++        return "|" + "|".join(cells) + "|"
++
++    lines = [sep, format_row(headers), sep]
++    for row in rows:
++        lines.append(format_row(row))
++    lines.append(sep)
++    return "\n".join(lines)
++
++
++def main():
++    print("=" * 80)
++    print("  cachetools Performance & Correctness Test Report")
++    print("=" * 80)
++
++    print("\n[1] Insert Throughput (ops/sec)")
++    print("-" * 80)
++    headers = ["Cache Type", "maxsize=100", "maxsize=1000", "maxsize=10000"]
++    rows = []
++    for name, cls in CACHE_TYPES.items():
++        row = [name]
++        for ms in MAXSIZE_VALUES:
++            _, ops = benchmark_insert(cls, ms)
++            row.append(f"{ops:,.0f}")
++        rows.append(row)
++    print(format_table(headers, rows))
++
++    print("\n[2] Query Throughput (ops/sec)")
++    print("-" * 80)
++    rows = []
++    for name, cls in CACHE_TYPES.items():
++        row = [name]
++        for ms in MAXSIZE_VALUES:
++            _, ops = benchmark_query(cls, ms)
++            row.append(f"{ops:,.0f}")
++        rows.append(row)
++    print(format_table(headers, rows))
++
++    print("\n[3] Mixed Read/Write Throughput (ops/sec)")
++    print("-" * 80)
++    rows = []
++    for name, cls in CACHE_TYPES.items():
++        row = [name]
++        for ms in MAXSIZE_VALUES:
++            _, ops = benchmark_mixed(cls, ms)
++            row.append(f"{ops:,.0f}")
++        rows.append(row)
++    print(format_table(headers, rows))
++
++    print("\n[4] TTL Expiration Test")
++    print("-" * 80)
++    ttl_results = test_ttl_expiration()
++    headers = ["Test Case", "Size Before", "Size After", "Passed"]
++    rows = [[r[0], str(r[1]), str(r[2]), "PASS" if r[3] else "FAIL"] for r in ttl_results]
++    print(format_table(headers, rows))
++
++    print("\n[5] Concurrency Test (10 threads)")
++    print("-" * 80)
++    conc_results = test_concurrency()
++    headers = ["Cache Type", "currsize", "maxsize", "Passed", "Errors"]
++    rows = [[r[0], str(r[1]), str(r[2]), "PASS" if r[3] else "FAIL", str(r[4])] for r in conc_results]
++    print(format_table(headers, rows))
++
++    print("\n[6] Memory Leak Check (tracemalloc)")
++    print("-" * 80)
++    mem_results = test_memory_leak()
++    headers = ["Cache Type", "currsize", "Memory Growth", "Passed"]
++    rows = [[r[0], str(r[1]), str(r[2]), "PASS" if r[3] else "FAIL"] for r in mem_results]
++    print(format_table(headers, rows))
++
++    print("\n" + "=" * 80)
++    all_passed = (
++        all(r[3] for r in ttl_results)
++        and all(r[3] for r in conc_results)
++        and all(r[3] for r in mem_results)
++    )
++    print(f"  Overall Result: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
++    print("=" * 80)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/pyproject.toml b/pyproject.toml
+index 8554d13..f2d3ad6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -47,6 +47,9 @@ where = ["src"]
+ [tool.setuptools.dynamic]
+ version = {attr = "cachetools.__version__"}
+ 
++[tool.pytest.ini_options]
++pythonpath = ["src"]
++
+ [tool.pyright]
+ typeCheckingMode = "standard"
+ reportFunctionMemberAccess = "information"
+diff --git a/tests/test_perf_benchmark.py b/tests/test_perf_benchmark.py
+new file mode 100644
+index 0000000..a1bb89a
+--- /dev/null
++++ b/tests/test_perf_benchmark.py
+@@ -0,0 +1,505 @@
++import threading
++import time
++import tracemalloc
++from concurrent.futures import ThreadPoolExecutor, as_completed
++
++import pytest
++
++from cachetools import FIFOCache, LFUCache, LRUCache, RRCache, TTLCache
++
++
++MAXSIZE_VALUES = [100, 1000, 10000]
++
++CACHE_TYPES = {
++    "LRUCache": LRUCache,
++    "FIFOCache": FIFOCache,
++    "LFUCache": LFUCache,
++    "RRCache": RRCache,
++}
++
++
++def _cache_id(params):
++    cache_cls, maxsize = params
++    return f"{cache_cls.__name__}-maxsize={maxsize}"
++
++
++def _fill_cache(cache, count):
++    for i in range(count):
++        cache[i] = i * 10
++
++
++# ============================================================
++# 1. pytest-benchmark: insertion and query throughput
++# ============================================================
++
++
++@pytest.fixture(
++    params=[
++        (cls, ms) for cls in CACHE_TYPES.values() for ms in MAXSIZE_VALUES
++    ],
++    ids=_cache_id,
++)
++def cache_instance(request):
++    cls, maxsize = request.param
++    return cls(maxsize=maxsize)
++
++
++class TestBenchmarkInsert:
++    def test_insert_throughput(self, benchmark, cache_instance):
++        maxsize = cache_instance.maxsize
++
++        def bench_insert():
++            cache_instance.clear()
++            for i in range(maxsize):
++                cache_instance[i] = i
++
++        benchmark(bench_insert)
++        assert cache_instance.currsize <= maxsize
++
++
++class TestBenchmarkQuery:
++    @pytest.fixture(autouse=True)
++    def populate_cache(self, cache_instance):
++        _fill_cache(cache_instance, cache_instance.maxsize)
++
++    def test_query_throughput(self, benchmark, cache_instance):
++        maxsize = cache_instance.maxsize
++
++        def bench_query():
++            for i in range(maxsize):
++                _ = cache_instance.get(i)
++
++        benchmark(bench_query)
++
++
++class TestBenchmarkMixed:
++    def test_mixed_read_write(self, benchmark, cache_instance):
++        maxsize = cache_instance.maxsize
++        _fill_cache(cache_instance, maxsize)
++
++        def bench_mixed():
++            for i in range(maxsize):
++                if i % 2 == 0:
++                    cache_instance[i] = i * 2
++                else:
++                    cache_instance.get(i)
++
++        benchmark(bench_mixed)
++
++
++# ============================================================
++# 2. TTL expiration: time.sleep to verify auto-shrink
++# ============================================================
++
++
++class TestTTLExpiration:
++    def test_ttl_expire_shrinks_currsize(self):
++        cache = TTLCache(maxsize=100, ttl=0.3)
++        for i in range(100):
++            cache[i] = i
++
++        assert cache.currsize == 100
++        assert len(cache) == 100
++
++        time.sleep(0.4)
++
++        assert cache.currsize == 0
++        assert len(cache) == 0
++
++    def test_ttl_partial_expire(self):
++        cache = TTLCache(maxsize=100, ttl=0.5)
++        for i in range(50):
++            cache[i] = i
++
++        time.sleep(0.3)
++
++        for i in range(50, 100):
++            cache[i] = i
++
++        assert cache.currsize == 100
++
++        time.sleep(0.3)
++
++        assert cache.currsize == 50
++        assert len(cache) == 50
++
++        for i in range(50, 100):
++            assert i in cache
++        for i in range(50):
++            assert i not in cache
++
++    def test_ttl_expire_does_not_exceed_maxsize(self):
++        cache = TTLCache(maxsize=10, ttl=0.3)
++        for i in range(20):
++            cache[i] = i
++
++        assert cache.currsize <= 10
++
++        time.sleep(0.4)
++
++        assert cache.currsize == 0
++
++        for i in range(5):
++            cache[i] = i
++
++        assert cache.currsize == 5
++        assert cache.currsize <= cache.maxsize
++
++    def test_ttl_expire_with_different_ttls(self):
++        cache = TTLCache(maxsize=50, ttl=0.2)
++        for i in range(50):
++            cache[i] = i
++
++        assert cache.currsize == 50
++
++        time.sleep(0.25)
++
++        assert cache.currsize == 0
++
++        for i in range(30):
++            cache[i] = i
++
++        assert cache.currsize == 30
++
++        time.sleep(0.25)
++
++        assert cache.currsize == 0
++
++    def test_ttl_currsize_never_exceeds_maxsize(self):
++        cache = TTLCache(maxsize=100, ttl=1.0)
++        for i in range(200):
++            cache[i] = i
++
++        assert cache.currsize <= 100
++        assert len(cache) <= 100
++
++
++# ============================================================
++# 3. Concurrency: 10 threads, assert currsize <= maxsize
++# ============================================================
++
++
++class TestConcurrency:
++    NTHREADS = 10
++    ITERATIONS = 500
++
++    def test_concurrent_insert_lru(self):
++        cache = LRUCache(maxsize=100)
++        errors = []
++
++        def worker(thread_id):
++            try:
++                for i in range(self.ITERATIONS):
++                    key = thread_id * self.ITERATIONS + i
++                    cache[key] = key
++                    _ = cache.get(key)
++            except Exception as e:
++                errors.append(e)
++
++        threads = [
++            threading.Thread(target=worker, args=(tid,))
++            for tid in range(self.NTHREADS)
++        ]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        assert len(errors) == 0, f"Errors during concurrent access: {errors}"
++        assert cache.currsize <= cache.maxsize, (
++            f"currsize={cache.currsize} exceeds maxsize={cache.maxsize}"
++        )
++
++    def test_concurrent_insert_fifo(self):
++        cache = FIFOCache(maxsize=100)
++        errors = []
++
++        def worker(thread_id):
++            try:
++                for i in range(self.ITERATIONS):
++                    key = thread_id * self.ITERATIONS + i
++                    cache[key] = key
++                    _ = cache.get(key)
++            except Exception as e:
++                errors.append(e)
++
++        threads = [
++            threading.Thread(target=worker, args=(tid,))
++            for tid in range(self.NTHREADS)
++        ]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        assert len(errors) == 0, f"Errors during concurrent access: {errors}"
++        assert cache.currsize <= cache.maxsize
++
++    def test_concurrent_insert_lfu(self):
++        cache = LFUCache(maxsize=100)
++        errors = []
++
++        def worker(thread_id):
++            try:
++                for i in range(self.ITERATIONS):
++                    key = thread_id * self.ITERATIONS + i
++                    cache[key] = key
++                    _ = cache.get(key)
++            except Exception as e:
++                errors.append(e)
++
++        threads = [
++            threading.Thread(target=worker, args=(tid,))
++            for tid in range(self.NTHREADS)
++        ]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        assert len(errors) == 0, f"Errors during concurrent access: {errors}"
++        assert cache.currsize <= cache.maxsize
++
++    def test_concurrent_insert_rr(self):
++        cache = RRCache(maxsize=100)
++        errors = []
++
++        def worker(thread_id):
++            try:
++                for i in range(self.ITERATIONS):
++                    key = thread_id * self.ITERATIONS + i
++                    cache[key] = key
++                    _ = cache.get(key)
++            except Exception as e:
++                errors.append(e)
++
++        threads = [
++            threading.Thread(target=worker, args=(tid,))
++            for tid in range(self.NTHREADS)
++        ]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        assert len(errors) == 0, f"Errors during concurrent access: {errors}"
++        assert cache.currsize <= cache.maxsize
++
++    def test_concurrent_ttl_cache(self):
++        cache = TTLCache(maxsize=100, ttl=2.0)
++        errors = []
++
++        def worker(thread_id):
++            try:
++                for i in range(self.ITERATIONS):
++                    key = thread_id * self.ITERATIONS + i
++                    cache[key] = key
++                    _ = cache.get(key)
++            except Exception as e:
++                errors.append(e)
++
++        threads = [
++            threading.Thread(target=worker, args=(tid,))
++            for tid in range(self.NTHREADS)
++        ]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        assert len(errors) == 0, f"Errors during concurrent access: {errors}"
++        assert cache.currsize <= cache.maxsize
++
++    def test_concurrent_read_heavy(self):
++        cache = LRUCache(maxsize=100)
++        for i in range(100):
++            cache[i] = i
++
++        errors = []
++        hits = [0] * self.NTHREADS
++
++        def reader(thread_id):
++            try:
++                for i in range(self.ITERATIONS):
++                    val = cache.get(i % 100)
++                    if val is not None:
++                        hits[thread_id] += 1
++            except Exception as e:
++                errors.append(e)
++
++        threads = [
++            threading.Thread(target=reader, args=(tid,))
++            for tid in range(self.NTHREADS)
++        ]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        assert len(errors) == 0
++        assert cache.currsize <= cache.maxsize
++        assert all(h > 0 for h in hits)
++
++    def test_concurrent_with_threadpool(self):
++        cache = LRUCache(maxsize=100)
++        lock = threading.Lock()
++        errors = []
++
++        def worker(thread_id):
++            try:
++                for i in range(self.ITERATIONS):
++                    key = thread_id * self.ITERATIONS + i
++                    with lock:
++                        cache[key] = key
++                        _ = cache.get(key)
++            except Exception as e:
++                errors.append(e)
++
++        with ThreadPoolExecutor(max_workers=self.NTHREADS) as executor:
++            futures = [
++                executor.submit(worker, tid) for tid in range(self.NTHREADS)
++            ]
++            for f in as_completed(futures):
++                f.result()
++
++        assert len(errors) == 0
++        assert cache.currsize <= cache.maxsize
++
++
++# ============================================================
++# 4. Memory leak check with tracemalloc
++# ============================================================
++
++
++class TestMemoryLeak:
++    ITERATIONS = 5
++    OPS_PER_ROUND = 10000
++
++    def test_no_memory_leak_lru(self):
++        tracemalloc.start()
++
++        cache = LRUCache(maxsize=1000)
++        baseline_snapshot = tracemalloc.take_snapshot()
++
++        for _ in range(self.ITERATIONS):
++            for i in range(self.OPS_PER_ROUND):
++                cache[i % 2000] = i
++
++        end_snapshot = tracemalloc.take_snapshot()
++        tracemalloc.stop()
++
++        stats = end_snapshot.compare_to(baseline_snapshot, "lineno")
++        total_diff = sum(s.size_diff for s in stats)
++        total_diff_kb = total_diff / 1024
++
++        assert cache.currsize <= cache.maxsize
++        assert total_diff_kb < 512, (
++            f"Potential memory leak: {total_diff_kb:.2f} KB growth detected"
++        )
++
++    def test_no_memory_leak_fifo(self):
++        tracemalloc.start()
++
++        cache = FIFOCache(maxsize=1000)
++        baseline_snapshot = tracemalloc.take_snapshot()
++
++        for _ in range(self.ITERATIONS):
++            for i in range(self.OPS_PER_ROUND):
++                cache[i % 2000] = i
++
++        end_snapshot = tracemalloc.take_snapshot()
++        tracemalloc.stop()
++
++        stats = end_snapshot.compare_to(baseline_snapshot, "lineno")
++        total_diff = sum(s.size_diff for s in stats)
++        total_diff_kb = total_diff / 1024
++
++        assert cache.currsize <= cache.maxsize
++        assert total_diff_kb < 512, (
++            f"Potential memory leak: {total_diff_kb:.2f} KB growth detected"
++        )
++
++    def test_no_memory_leak_lfu(self):
++        tracemalloc.start()
++
++        cache = LFUCache(maxsize=1000)
++        baseline_snapshot = tracemalloc.take_snapshot()
++
++        for _ in range(self.ITERATIONS):
++            for i in range(self.OPS_PER_ROUND):
++                cache[i % 2000] = i
++
++        end_snapshot = tracemalloc.take_snapshot()
++        tracemalloc.stop()
++
++        stats = end_snapshot.compare_to(baseline_snapshot, "lineno")
++        total_diff = sum(s.size_diff for s in stats)
++        total_diff_kb = total_diff / 1024
++
++        assert cache.currsize <= cache.maxsize
++        assert total_diff_kb < 512, (
++            f"Potential memory leak: {total_diff_kb:.2f} KB growth detected"
++        )
++
++    def test_no_memory_leak_ttl(self):
++        tracemalloc.start()
++
++        cache = TTLCache(maxsize=1000, ttl=10.0)
++        baseline_snapshot = tracemalloc.take_snapshot()
++
++        for _ in range(self.ITERATIONS):
++            for i in range(self.OPS_PER_ROUND):
++                cache[i % 2000] = i
++
++        end_snapshot = tracemalloc.take_snapshot()
++        tracemalloc.stop()
++
++        stats = end_snapshot.compare_to(baseline_snapshot, "lineno")
++        total_diff = sum(s.size_diff for s in stats)
++        total_diff_kb = total_diff / 1024
++
++        assert cache.currsize <= cache.maxsize
++        assert total_diff_kb < 512, (
++            f"Potential memory leak: {total_diff_kb:.2f} KB growth detected"
++        )
++
++    def test_no_memory_leak_with_clear(self):
++        tracemalloc.start()
++
++        cache = LRUCache(maxsize=1000)
++        baseline_snapshot = tracemalloc.take_snapshot()
++
++        for _ in range(self.ITERATIONS):
++            for i in range(self.OPS_PER_ROUND):
++                cache[i % 2000] = i
++            cache.clear()
++
++        end_snapshot = tracemalloc.take_snapshot()
++        tracemalloc.stop()
++
++        stats = end_snapshot.compare_to(baseline_snapshot, "lineno")
++        total_diff = sum(s.size_diff for s in stats)
++        total_diff_kb = total_diff / 1024
++
++        assert cache.currsize == 0
++        assert total_diff_kb < 256, (
++            f"Potential memory leak after clear: {total_diff_kb:.2f} KB growth detected"
++        )
++
++    def test_tracemalloc_top_allocations(self):
++        tracemalloc.start()
++
++        cache = LRUCache(maxsize=1000)
++        for _ in range(self.ITERATIONS):
++            for i in range(self.OPS_PER_ROUND):
++                cache[i % 2000] = i
++
++        snapshot = tracemalloc.take_snapshot()
++        tracemalloc.stop()
++
++        top_stats = snapshot.statistics("lineno")
++        print("\nTop 10 memory allocations:")
++        for stat in top_stats[:10]:
++            print(stat)
++
++        assert cache.currsize <= cache.maxsize
