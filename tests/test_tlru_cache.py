@@ -1,0 +1,272 @@
+import time
+import pytest
+from cachetools import TLRUCache
+
+
+class TestTLRUCacheMaxsize:
+    def test_maxsize_basic_eviction(self):
+        cache = TLRUCache(maxsize=3, ttu=lambda k, v, t: t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        cache[3] = "c"
+        assert len(cache) == 3
+        assert set(cache.keys()) == {1, 2, 3}
+        cache[4] = "d"
+        assert len(cache) == 3
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+        assert 4 in cache
+
+    def test_maxsize_eviction_order_fifo(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        cache[3] = "c"
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+
+    def test_maxsize_access_does_not_affect_eviction_order(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        _ = cache[1]
+        cache[3] = "c"
+        assert len(cache) == 2
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+
+    def test_maxsize_update_existing(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        cache[1] = "updated"
+        assert cache[1] == "updated"
+        assert len(cache) == 2
+
+    def test_maxsize_one(self):
+        cache = TLRUCache(maxsize=1, ttu=lambda k, v, t: t + 60)
+        cache[1] = "a"
+        assert cache[1] == "a"
+        cache[2] = "b"
+        assert len(cache) == 1
+        assert 1 not in cache
+        assert cache[2] == "b"
+
+    def test_maxsize_with_getsizeof(self):
+        cache = TLRUCache(maxsize=5, ttu=lambda k, v, t: t + 60, getsizeof=lambda v: v)
+        cache[1] = 2
+        cache[2] = 3
+        assert len(cache) == 2
+        assert cache.currsize == 5
+        cache[3] = 6
+        assert len(cache) == 1
+        assert 3 in cache
+        assert 1 not in cache
+        assert 2 not in cache
+
+
+class TestTLRUCacheTTLExpiration:
+    def test_ttl_expiration_basic(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1)
+        cache[1] = "a"
+        cache[2] = "b"
+        assert 1 in cache
+        assert 2 in cache
+        time.sleep(0.15)
+        assert 1 not in cache
+        assert 2 not in cache
+
+    def test_ttl_staggered_expiration(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + v)
+        cache[1] = 1
+        time.sleep(0.05)
+        cache[2] = 2
+        time.sleep(0.1)
+        assert 1 not in cache
+        assert 2 in cache
+        time.sleep(1.0)
+        assert 2 not in cache
+
+    def test_ttl_access_does_not_reset_expiry(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1)
+        cache[1] = "a"
+        time.sleep(0.05)
+        _ = cache[1]
+        time.sleep(0.08)
+        assert 1 not in cache
+
+    def test_ttl_get_returns_none_after_expiry(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1)
+        cache[1] = "a"
+        time.sleep(0.15)
+        assert cache.get(1) is None
+        assert cache.get(1, "default") == "default"
+
+    def test_ttl_popitem_after_expiry(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1)
+        cache[1] = "a"
+        cache[2] = "b"
+        time.sleep(0.15)
+        with pytest.raises(KeyError):
+            cache.popitem()
+
+    def test_ttl_expire_method(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1)
+        cache[1] = "a"
+        cache[2] = "b"
+        time.sleep(0.15)
+        expired = cache.expire()
+        assert len(expired) == 2
+        expired_keys = {k for k, v in expired}
+        assert expired_keys == {1, 2}
+        assert len(cache) == 0
+
+    def test_ttl_infinite(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: float("inf"))
+        cache[1] = "a"
+        time.sleep(0.1)
+        assert 1 in cache
+        assert cache[1] == "a"
+
+
+class TestTLRUCacheEvictionPriority:
+    def test_ttl_expired_evicted_before_lru(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 0.1)
+        cache[1] = "a"
+        time.sleep(0.15)
+        cache[2] = "b"
+        cache[3] = "c"
+        assert len(cache) == 2
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+
+    def test_mixed_ttl_and_maxsize_eviction(self):
+        cache = TLRUCache(maxsize=3, ttu=lambda k, v, t: t + 0.1 if k % 2 == 0 else t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        cache[3] = "c"
+        time.sleep(0.15)
+        cache[4] = "d"
+        cache[5] = "e"
+        assert len(cache) == 3
+        assert 2 not in cache
+        assert 1 in cache
+        assert 3 in cache
+        assert 4 in cache
+        assert 5 in cache
+
+    def test_expire_removes_expired_before_maxsize_eviction(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 0.1 if k == 1 else t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        time.sleep(0.15)
+        cache[3] = "c"
+        assert len(cache) == 2
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+
+    def test_multiple_expired_items_cleared_before_eviction(self):
+        cache = TLRUCache(maxsize=3, ttu=lambda k, v, t: t + 0.05 if k <= 3 else t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        cache[3] = "c"
+        time.sleep(0.1)
+        cache[4] = "d"
+        cache[5] = "e"
+        cache[6] = "f"
+        assert len(cache) == 3
+        assert 1 not in cache
+        assert 2 not in cache
+        assert 3 not in cache
+        assert 4 in cache
+        assert 5 in cache
+        assert 6 in cache
+
+    def test_no_expired_items_uses_lru_eviction(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        cache[3] = "c"
+        assert len(cache) == 2
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+
+
+class TestTLRUCacheEdgeCases:
+    def test_empty_cache_operations(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 60)
+        assert len(cache) == 0
+        assert list(cache) == []
+        with pytest.raises(KeyError):
+            cache.popitem()
+
+    def test_clear_resets_state(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        cache.clear()
+        assert len(cache) == 0
+        assert cache.currsize == 0
+        cache[3] = "c"
+        cache[4] = "d"
+        assert len(cache) == 2
+        assert 3 in cache
+        assert 4 in cache
+
+    def test_setitem_with_immediately_expired(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t - 1)
+        cache[1] = "a"
+        assert len(cache) == 0
+        assert 1 not in cache
+
+    def test_contains_after_expiry(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1)
+        cache[1] = "a"
+        assert 1 in cache
+        time.sleep(0.15)
+        assert 1 not in cache
+
+    def test_del_after_expiry(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1)
+        cache[1] = "a"
+        time.sleep(0.15)
+        with pytest.raises(KeyError):
+            del cache[1]
+
+    def test_iteration_skips_expired(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1 if k == 1 else t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        cache[3] = "c"
+        time.sleep(0.15)
+        keys = list(cache)
+        assert 1 not in keys
+        assert 2 in keys
+        assert 3 in keys
+
+    def test_keys_values_items_after_expiry(self):
+        cache = TLRUCache(maxsize=10, ttu=lambda k, v, t: t + 0.1 if k == 1 else t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        time.sleep(0.15)
+        assert 1 not in cache.keys()
+        assert 2 in cache.keys()
+        assert "b" in cache.values()
+        assert (2, "b") in list(cache.items())
+
+    def test_heap_cleanup_after_repeated_updates(self):
+        cache = TLRUCache(maxsize=2, ttu=lambda k, v, t: t + 60)
+        cache[1] = "a"
+        cache[2] = "b"
+        for i in range(10):
+            cache[1] = f"updated_{i}"
+            cache[2] = f"updated_{i}"
+        assert cache[1] == "updated_9"
+        assert cache[2] == "updated_9"
+        assert len(cache) == 2
