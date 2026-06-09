@@ -19,7 +19,6 @@ import collections.abc
 import functools
 import heapq
 import random
-import threading
 import time
 
 from . import keys
@@ -398,7 +397,6 @@ class _TimedCache(Cache):
     def __init__(self, maxsize, timer, getsizeof=None):
         Cache.__init__(self, maxsize, getsizeof)
         self.__timer = _TimedCache._Timer(timer)
-        self._lock = threading.RLock()
 
     def __repr__(self, cache_repr=Cache.__repr__):
         with self.__timer as time:
@@ -470,61 +468,56 @@ class TTLCache(_TimedCache):
         self.__ttl = ttl
 
     def __contains__(self, key):
-        with self._lock:
-            try:
-                link = self.__links[key]  # no reordering
-            except KeyError:
-                return False
-            else:
-                return self.timer() < link.expires
+        try:
+            link = self.__links[key]  # no reordering
+        except KeyError:
+            return False
+        else:
+            return self.timer() < link.expires
 
     def __getitem__(self, key, cache_getitem=Cache.__getitem__):
-        with self._lock:
-            try:
-                link = self.__getlink(key)
-            except KeyError:
-                expired = False
-            else:
-                expired = not (self.timer() < link.expires)
-            if expired:
-                return self.__missing__(key)
-            else:
-                return cache_getitem(self, key)
+        try:
+            link = self.__getlink(key)
+        except KeyError:
+            expired = False
+        else:
+            expired = not (self.timer() < link.expires)
+        if expired:
+            return self.__missing__(key)
+        else:
+            return cache_getitem(self, key)
 
     def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
-        with self._lock:
-            with self.timer as time:
-                self.expire(time)
-                cache_setitem(self, key, value)
-            try:
-                link = self.__getlink(key)
-            except KeyError:
-                self.__links[key] = link = TTLCache._Link(key)
-            else:
-                link.unlink()
-            link.expires = time + self.__ttl
-            link.next = root = self.__root
-            link.prev = prev = root.prev
-            prev.next = root.prev = link
+        with self.timer as time:
+            self.expire(time)
+            cache_setitem(self, key, value)
+        try:
+            link = self.__getlink(key)
+        except KeyError:
+            self.__links[key] = link = TTLCache._Link(key)
+        else:
+            link.unlink()
+        link.expires = time + self.__ttl
+        link.next = root = self.__root
+        link.prev = prev = root.prev
+        prev.next = root.prev = link
 
     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
-        with self._lock:
-            cache_delitem(self, key)
-            link = self.__links.pop(key)
-            link.unlink()
-            if not (self.timer() < link.expires):
-                raise KeyError(key)
+        cache_delitem(self, key)
+        link = self.__links.pop(key)
+        link.unlink()
+        if not (self.timer() < link.expires):
+            raise KeyError(key)
 
     def __iter__(self):
-        with self._lock:
-            root = self.__root
-            curr = root.next
-            while curr is not root:
-                # "freeze" time for iterator access
-                with self.timer as time:
-                    if time < curr.expires:
-                        yield curr.key
-                curr = curr.next
+        root = self.__root
+        curr = root.next
+        while curr is not root:
+            # "freeze" time for iterator access
+            with self.timer as time:
+                if time < curr.expires:
+                    yield curr.key
+            curr = curr.next
 
     def __setstate__(self, state):
         self.__dict__.update(state)
@@ -548,21 +541,20 @@ class TTLCache(_TimedCache):
         """
         if time is None:
             time = self.timer()
-        with self._lock:
-            root = self.__root
-            curr = root.next
-            links = self.__links
-            expired = []
-            cache_delitem = Cache.__delitem__
-            cache_getitem = Cache.__getitem__
-            while curr is not root and not (time < curr.expires):
-                expired.append((curr.key, cache_getitem(self, curr.key)))
-                cache_delitem(self, curr.key)
-                del links[curr.key]
-                next = curr.next
-                curr.unlink()
-                curr = next
-            return expired
+        root = self.__root
+        curr = root.next
+        links = self.__links
+        expired = []
+        cache_delitem = Cache.__delitem__
+        cache_getitem = Cache.__getitem__
+        while curr is not root and not (time < curr.expires):
+            expired.append((curr.key, cache_getitem(self, curr.key)))
+            cache_delitem(self, curr.key)
+            del links[curr.key]
+            next = curr.next
+            curr.unlink()
+            curr = next
+        return expired
 
     def popitem(self):
         """Remove and return the `(key, value)` pair least recently used that
@@ -570,14 +562,13 @@ class TTLCache(_TimedCache):
 
         """
         with self.timer as time:
-            with self._lock:
-                self.expire(time)
-                try:
-                    key = next(iter(self.__links))
-                except StopIteration:
-                    raise KeyError("%s is empty" % type(self).__name__) from None
-                else:
-                    return (key, self.pop(key))
+            self.expire(time)
+            try:
+                key = next(iter(self.__links))
+            except StopIteration:
+                raise KeyError("%s is empty" % type(self).__name__) from None
+            else:
+                return (key, self.pop(key))
 
     def clear(self):
         _TimedCache.clear(self)
